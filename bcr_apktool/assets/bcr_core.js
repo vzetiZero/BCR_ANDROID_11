@@ -791,7 +791,13 @@
   function readTrayDenoms() {
     var out = [];
     var seen = {};
+    /* Quét CẢ "revolver" (bánh xe chip của Evolution): các mệnh giá nằm trong
+     * `revolver-chip-item` và thường XẾP CHỒNG cùng toạ độ. Nếu chỉ quét
+     * `chip-stack` thì dễ chỉ thấy 1-2 mệnh giá đang lộ ra, thiếu chip lớn →
+     * phải bấm hàng chục lần cho bậc cao và không kịp cửa cược. */
     var scopes = [
+      document.querySelector('[data-role="revolver-item-list"]'),
+      document.querySelector('[data-role="revolver-overlay"]'),
       document.querySelector('[data-role="chip-stack"]'),
       document.querySelector('[data-role="chip-stack-toggle"]'),
       document.querySelector('[data-role="selected-chip"]')
@@ -802,7 +808,7 @@
       var els = scope.querySelectorAll('[data-role="chip"][data-value]');
       for (var i = 0; i < els.length; i++) {
         var el = els[i];
-        if (!visible(el)) continue;
+        if (!shown(el)) continue;
         var v = parseInt(el.getAttribute('data-value'), 10);
         if (isFinite(v) && v > 0 && !seen[v]) { seen[v] = 1; out.push(v); }
       }
@@ -813,12 +819,26 @@
 
   /**
    * Mở khay để thấy ĐẦY ĐỦ mệnh giá.
-   * Chỉ bấm nút toggle khi khay đang hiện ít mệnh giá; nếu đã thấy nhiều thì giữ
-   * nguyên (bấm toggle lúc khay đang mở sẽ ĐÓNG nó lại).
+   *
+   * Chỉ mở khi THẬT SỰ cần: nếu kế hoạch hiện tại ghép được bằng những mệnh giá
+   * đang thấy thì không mở, vì mỗi lần mở/đóng khay tốn ~900 ms — với bậc thấp
+   * (20/40/80) khoản đó còn lớn hơn cả thời gian bấm chip.
+   *
+   * Trả mảng mệnh giá (có thể kèm cờ `spotChanged` cho nơi gọi).
    */
-  async function revealDenominations(side, timeoutMs) {
+  async function revealDenominations(side, timeoutMs, needValues) {
     var denoms = readTrayDenoms();
+
+    // Đã đủ mệnh giá để ghép [needValues] thì không cần mở khay.
+    if (needValues && needValues.length && denoms.length) {
+      var canCover = needValues.every(function (v) {
+        return denoms.indexOf(v) >= 0 ||
+          denoms.some(function (d) { return v % d === 0; });
+      });
+      if (canCover) return denoms;
+    }
     if (denoms.length >= 6) return denoms;
+
     var toggle = document.querySelector('[data-role="chip-stack-toggle"]');
     if (!toggle || !visible(toggle)) return denoms;
     var p = pointOf(toggle);
@@ -830,10 +850,10 @@
     var until = Date.now() + (Number(timeoutMs) || 900);
     var grewAt = Date.now();
     while (Date.now() < until) {
-      await sleep(18);
+      await sleep(14);
       var now = readTrayDenoms();
       if (now.length > denoms.length) { denoms = now; grewAt = Date.now(); }
-      else if (denoms.length && Date.now() - grewAt > 200) break;
+      else if (denoms.length && Date.now() - grewAt > 160) break;
     }
 
     // Mở khay mà tiền trên ô đổi nghĩa là đã lỡ đặt gì đó — báo cho nơi gọi.
@@ -1197,6 +1217,25 @@
     if (!el) return false;
     // Element có thể đã bị React thay khỏi DOM giữa lúc đo và lúc bấm.
     if (!document.contains(el)) return false;
+    /* Cửa sự kiện tới ĐÚNG phần tử nhận cú bấm.
+     *
+     * Bàn Evolution đặt ô cược bằng overlay SVG: chính `[data-role="bet-spot-*"]`
+     * có `pointer-events: none`, còn thứ nhận bấm là `<path>` bên trong. Phát sự
+     * kiện lên chính ô cược (như bản trước) vẫn "thành công" nhưng site KHÔNG
+     * tính là một cú đặt — đây là lý do tap bị bỏ mà không có lỗi nào.
+     * Tra điểm bấm một lần nữa rồi phát lên phần tử thật đó. */
+    var hit = null;
+    try {
+      hit = document.elementFromPoint(x, y);
+    } catch (e) { hit = null; }
+    if (hit && hit !== el) {
+      var a = hit, ok = false;
+      for (var up = 0; up < 8 && a; up++) {
+        if (a === el) { ok = true; break; }
+        a = a.parentElement || (a.parentNode && a.parentNode.host) || null;
+      }
+      if (ok) el = hit;
+    }
     fire(el, 'pointerover', x, y);
     fire(el, 'pointerenter', x, y);
     fire(el, 'mouseover', x, y);
@@ -1334,13 +1373,28 @@
         var y = r.y + r.height / 2;
         var abs = toTop(x, y);
         var n = Math.min(size, left);
+        /* Trong một lô phát lần lượt, cách nhau ~15 ms.
+         *
+         * Bản trước phát cả lô trong CÙNG một tick. Trình duyệt không gộp, nhưng
+         * site có thể tự bỏ những cú trùng nhau trong vài ms — bỏ cú thì phải bấm
+         * bù nên tổng lại chậm hơn. 15 ms vẫn nhanh gấp 10 lần nhịp 150 ms, mà
+         * mỗi cú lại chắc chắn được tính. */
         for (var i = 0; i < n; i++) {
-          taps += 1;
-          steps.push({ kind: 'spot', n: taps, x: x, y: y, abs: abs });
-          synthTap({ el: spot, x: x, y: y });
+          (function (k) {
+            setTimeout(function () {
+              if (!quickReady(spot)) return;
+              taps += 1;
+              steps.push({ kind: 'spot', n: taps, x: x, y: y, abs: abs });
+              synthTap({ el: spot, x: x, y: y });
+            }, k * 15);
+          })(i);
         }
         left -= n;
-        if (left <= 0) { resolve(taps); return; }
+        if (left <= 0) {
+          // Chờ cú cuối kịp phát rồi mới trả kết quả.
+          setTimeout(function () { resolve(taps); }, (n - 1) * 15 + 20);
+          return;
+        }
         setTimeout(round, delay);
       }
       round();
@@ -1474,12 +1528,19 @@
     var denoms = (first.denominations && first.denominations.length)
       ? first.denominations : [20, 50, 250, 1000, 5000, 10000];
 
+    // Mệnh giá ĐOÁN trước khi bấm (chỉ dùng cho dryRun và cho lời nhắn). Số thật sẽ
+    // được đo bằng chip vừa lên bàn ở lần bấm đầu tiên.
+    var guess = Number(first.selected_chip) || denoms[0] || want;
+
     /* --- TỰ CHỌN MỆNH GIÁ ---
      * Người dùng không chọn chip; tool chọn tổ hợp ít tốn thời gian nhất. Ưu tiên
-     * mệnh giá mà mình đã thấy trong khay; nếu thiếu thì mở khay ra xem đủ. */
+     * mệnh giá đã thấy trong khay; CHỈ mở khay khi thật sự cần thêm mệnh giá lớn,
+     * vì mỗi lần mở/đóng tốn ~900 ms — lớn hơn cả thời gian bấm ở bậc thấp.
+     *
+     * `need` là mức cần ghép, dùng để quyết định "có cần mở khay không". */
     if (args.autoChip !== false && !args.dryRun) {
       try {
-        var richer = await revealDenominations(side, 900);
+        var richer = await revealDenominations(side, 900, [want]);
         if (richer && richer.length) denoms = richer.slice();
         if (richer && richer.spotChanged) {
           return {
@@ -1496,10 +1557,6 @@
       merge.sort(function (a, b) { return a - b; });
       denoms = merge;
     }
-
-    // Mệnh giá ĐOÁN trước khi bấm (chỉ dùng cho dryRun và cho lời nhắn). Số thật sẽ
-    // được đo bằng chip vừa lên bàn ở lần bấm đầu tiên.
-    var guess = Number(first.selected_chip) || denoms[0] || want;
 
     // dryRun: chỉ trả toạ độ các lần bấm ô cược (native bấm cảm ứng thật).
     if (args.dryRun) {
@@ -1518,16 +1575,18 @@
     }
 
     /* --- tốc độ ---
-     * Chế độ AUTO: 150 ms mỗi cú bấm (đúng nhịp site nhận ổn định, ~6-7 cú/giây).
-     * Nhanh hơn 150 ms thì site hay bỏ cú, mà bỏ cú thì phải bấm bù nên chậm hơn.
-     * Vẫn cho args.clickDelayMs ghi đè khi cần tinh chỉnh theo từng bàn. */
+     * `clickDelayMs` giờ là KHOẢNG NGHỈ GIỮA CÁC LÔ, không phải giữa từng cú.
+     * Trong một lô các cú bấm phát liền nhau (site tự gộp), nên thời gian thực
+     * cho mỗi cú giảm mạnh mà vẫn đọc lại tiền sau mỗi lô để không đặt vượt.
+     *
+     * Vì số cú mỗi lô luôn bị chặn bởi `ceil(phần còn thiếu / mệnh giá)`, dù site
+     * nhận đủ cả lô thì tổng cũng không thể vượt mức cần đặt. */
     var rawDelay = Number(args.clickDelayMs);
     var delay = isFinite(rawDelay) && rawDelay > 0
       ? Math.max(30, Math.min(400, rawDelay))
       : 150;
-    // Mỗi lô bấm liền một task để React gộp render; 1 cú/lô ở chế độ auto cho nhịp
-    // đều và dễ đọc lại tiền sau mỗi cú.
-    var batchSize = Math.max(1, Math.min(12, Number(args.batchSize) || 1));
+    // 6 cú/lô: bậc 8 với mệnh giá tự chọn chỉ còn 2 lô thay vì 7 lô rời.
+    var batchSize = Math.max(1, Math.min(12, Number(args.batchSize) || 6));
 
     var start = spotAmount(side);
     if (start === null) {
