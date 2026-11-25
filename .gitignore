@@ -1,0 +1,20 @@
+# Build output
+/build/unsigned.apk
+/build/aligned.apk
+/build/*.idsig
+/bcr_apktool/build/
+
+# Large intermediate artifacts (regenerate with tools)
+/BCRAndroid-v1.16_extracted/
+/BCRAndroid-v1.16_decoded/
+/bcr_java/
+__pycache__/
+
+# Keep: bcr_apktool/ (editable source), build/*.apk (release), build/*.jks (signing)
+!build/BCRAndroid-mod.apk
+!build/bcr-release.jks
+
+# OS junk
+Thumbs.db
+desktop.ini
+.DS_Store
