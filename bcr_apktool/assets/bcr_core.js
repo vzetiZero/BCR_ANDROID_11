@@ -772,6 +772,161 @@
     return chips[0].parentElement;
   }
 
+  /* ======================= TỰ CHỌN MỆNH GIÁ (auto) =======================
+   *
+   * Người dùng KHÔNG tự chọn chip. Tool đọc hết mệnh giá trong khay rồi ghép tổ
+   * hợp ít chi phí nhất, vì:
+   *   - native chỉ thấy mệnh giá lúc khay đang thu gọn → hay chọn chip nhỏ, phải
+   *     bấm hàng trăm cú, không kịp cửa sổ cược của bàn EV;
+   *   - mỗi cú bấm tốn [delay] ms, mỗi lần ĐỔI mệnh giá tốn thêm ~250 ms (mở khay,
+   *     chọn, xác nhận) → tối ưu phải tính cả hai khoản, không chỉ đếm số chip.
+   */
+
+  function gcdOf(a, b) {
+    while (b) { var t = a % b; a = b; b = t; }
+    return a;
+  }
+
+  /** Đọc mọi mệnh giá đang thấy trong khay/chip đang chọn. */
+  function readTrayDenoms() {
+    var out = [];
+    var seen = {};
+    var scopes = [
+      document.querySelector('[data-role="chip-stack"]'),
+      document.querySelector('[data-role="chip-stack-toggle"]'),
+      document.querySelector('[data-role="selected-chip"]')
+    ];
+    for (var s = 0; s < scopes.length; s++) {
+      var scope = scopes[s];
+      if (!scope) continue;
+      var els = scope.querySelectorAll('[data-role="chip"][data-value]');
+      for (var i = 0; i < els.length; i++) {
+        var el = els[i];
+        if (!visible(el)) continue;
+        var v = parseInt(el.getAttribute('data-value'), 10);
+        if (isFinite(v) && v > 0 && !seen[v]) { seen[v] = 1; out.push(v); }
+      }
+    }
+    out.sort(function (a, b) { return a - b; });
+    return out;
+  }
+
+  /**
+   * Mở khay để thấy ĐẦY ĐỦ mệnh giá.
+   * Chỉ bấm nút toggle khi khay đang hiện ít mệnh giá; nếu đã thấy nhiều thì giữ
+   * nguyên (bấm toggle lúc khay đang mở sẽ ĐÓNG nó lại).
+   */
+  async function revealDenominations(side, timeoutMs) {
+    var denoms = readTrayDenoms();
+    if (denoms.length >= 6) return denoms;
+    var toggle = document.querySelector('[data-role="chip-stack-toggle"]');
+    if (!toggle || !visible(toggle)) return denoms;
+    var p = pointOf(toggle);
+    if (!p) return denoms;
+
+    var before = spotAmount(side);
+    synthTap({ el: toggle, x: p.x, y: p.y });
+
+    var until = Date.now() + (Number(timeoutMs) || 900);
+    var grewAt = Date.now();
+    while (Date.now() < until) {
+      await sleep(18);
+      var now = readTrayDenoms();
+      if (now.length > denoms.length) { denoms = now; grewAt = Date.now(); }
+      else if (denoms.length && Date.now() - grewAt > 200) break;
+    }
+
+    // Mở khay mà tiền trên ô đổi nghĩa là đã lỡ đặt gì đó — báo cho nơi gọi.
+    var after = spotAmount(side);
+    if (before !== null && after !== null && Math.abs(after - before) > 0.5) {
+      denoms.spotChanged = true;
+    }
+    return denoms;
+  }
+
+  /** Tổ hợp CHÍNH XÁC với ít chip nhất (DP không giới hạn số đồng). */
+  function minChipPlan(amount, coins) {
+    var g = coins.reduce(function (a, b) { return gcdOf(a, b); });
+    if (!g || amount % g !== 0) return null;
+    var target = amount / g;
+    if (target > 20000) return null;
+    var units = coins.map(function (c) { return c / g; });
+    var best = new Array(target + 1);
+    var prev = new Array(target + 1);
+    best[0] = 0;
+    for (var s = 1; s <= target; s++) {
+      best[s] = -1;
+      for (var i = 0; i < units.length; i++) {
+        var u = units[i];
+        if (u > s || best[s - u] < 0) continue;
+        if (best[s] < 0 || best[s - u] + 1 < best[s]) {
+          best[s] = best[s - u] + 1;
+          prev[s] = u;
+        }
+      }
+    }
+    if (best[target] < 0) return null;
+    var out = [];
+    var cur = target;
+    var guard = 0;
+    while (cur > 0 && guard++ < 1000) {
+      var u2 = prev[cur];
+      if (!u2) return null;
+      out.push(u2 * g);
+      cur -= u2;
+    }
+    return out;
+  }
+
+  /**
+   * Chọn tổ hợp chip rẻ nhất về THỜI GIAN cho [amount].
+   * Trả { plan, clicks, cost } hoặc null nếu không ghép chính xác được.
+   */
+  function chooseChipPlan(amount, denoms, delayMs) {
+    var want = Math.round(Number(amount) || 0);
+    if (want <= 0) return null;
+    var coins = (denoms || []).map(Math.round).filter(function (v) {
+      return v > 0 && v <= want;
+    });
+    coins = coins.filter(function (v, i, a) { return a.indexOf(v) === i; })
+      .sort(function (a, b) { return b - a; });
+    if (!coins.length) return null;
+
+    var perClick = isFinite(delayMs) && delayMs > 0 ? delayMs : 150;
+    var switchCost = 250;
+
+    var plans = [];
+    // 1) Một mệnh giá duy nhất chia hết (0 lần đổi chip).
+    for (var i = 0; i < coins.length; i++) {
+      if (want % coins[i] !== 0) continue;
+      var n = want / coins[i];
+      if (n > 400) continue;
+      var arr = [];
+      for (var k = 0; k < n; k++) arr.push(coins[i]);
+      plans.push(arr);
+    }
+    // 2) Tổ hợp tối thiểu số chip (DP).
+    var dp = minChipPlan(want, coins);
+    if (dp && dp.length) plans.push(dp);
+    if (!plans.length) return null;
+
+    var best = null;
+    var bestCost = Infinity;
+    for (var p = 0; p < plans.length; p++) {
+      var plan = plans[p];
+      var distinct = {};
+      for (var q = 0; q < plan.length; q++) distinct[plan[q]] = 1;
+      var switches = Object.keys(distinct).length;
+      var cost = plan.length * perClick + Math.max(0, switches - 1) * switchCost;
+      if (cost < bestCost) { bestCost = cost; best = plan; }
+    }
+    return {
+      plan: best.slice().sort(function (a, b) { return b - a; }),
+      clicks: best.length,
+      cost: Math.round(bestCost)
+    };
+  }
+
   /**
    * Ô cược THẬT của một cửa.
    *
@@ -1318,6 +1473,30 @@
 
     var denoms = (first.denominations && first.denominations.length)
       ? first.denominations : [20, 50, 250, 1000, 5000, 10000];
+
+    /* --- TỰ CHỌN MỆNH GIÁ ---
+     * Người dùng không chọn chip; tool chọn tổ hợp ít tốn thời gian nhất. Ưu tiên
+     * mệnh giá mà mình đã thấy trong khay; nếu thiếu thì mở khay ra xem đủ. */
+    if (args.autoChip !== false && !args.dryRun) {
+      try {
+        var richer = await revealDenominations(side, 900);
+        if (richer && richer.length) denoms = richer.slice();
+        if (richer && richer.spotChanged) {
+          return {
+            ok: false, reason: 'table_changed',
+            note: 'Tiền trên ô đổi khi mở khay chip; dừng để kiểm tra.'
+          };
+        }
+      } catch (e) { /* giữ mệnh giá cũ */ }
+      // Gộp thêm mệnh giá mặc định của EV để ghép được cả bậc lớn.
+      var merge = denoms.slice();
+      [20, 50, 250, 1000, 5000, 10000, 50000].forEach(function (v) {
+        if (merge.indexOf(v) < 0) merge.push(v);
+      });
+      merge.sort(function (a, b) { return a - b; });
+      denoms = merge;
+    }
+
     // Mệnh giá ĐOÁN trước khi bấm (chỉ dùng cho dryRun và cho lời nhắn). Số thật sẽ
     // được đo bằng chip vừa lên bàn ở lần bấm đầu tiên.
     var guess = Number(first.selected_chip) || denoms[0] || want;
@@ -1338,27 +1517,44 @@
       };
     }
 
-    /* --- tốc độ --- */
-    // clickDelayMs của native (mặc định 40) được coi là mức TRẦN; chế độ nhanh hạ
-    // xuống tối đa 12 ms giữa các lô, trong mỗi lô bấm liền một task.
+    /* --- tốc độ ---
+     * Chế độ AUTO: 150 ms mỗi cú bấm (đúng nhịp site nhận ổn định, ~6-7 cú/giây).
+     * Nhanh hơn 150 ms thì site hay bỏ cú, mà bỏ cú thì phải bấm bù nên chậm hơn.
+     * Vẫn cho args.clickDelayMs ghi đè khi cần tinh chỉnh theo từng bàn. */
     var rawDelay = Number(args.clickDelayMs);
-    var delay = isFinite(rawDelay) ? Math.max(0, Math.min(120, rawDelay)) : 8;
-    if (args.fastTap !== false) delay = Math.min(delay, 12);
-    var batchSize = Math.max(1, Math.min(12, Number(args.batchSize) || 5));
+    var delay = isFinite(rawDelay) && rawDelay > 0
+      ? Math.max(30, Math.min(400, rawDelay))
+      : 150;
+    // Mỗi lô bấm liền một task để React gộp render; 1 cú/lô ở chế độ auto cho nhịp
+    // đều và dễ đọc lại tiền sau mỗi cú.
+    var batchSize = Math.max(1, Math.min(12, Number(args.batchSize) || 1));
 
     var start = spotAmount(side);
     if (start === null) {
       return { ok: false, reason: 'no_targets', note: 'Không đọc được ô ' + role + '.' };
     }
-    var chipPlan = Array.isArray(args.chipPlan) ? args.chipPlan.map(function (v) {
-      return Math.round(Number(v) || 0);
-    }) : [];
+
+    /* --- chọn tổ hợp chip ---
+     * Native có thể gửi chipPlan dựa trên mệnh giá nó thấy lúc khay thu gọn (hay chỉ
+     * có chip nhỏ → hàng trăm cú bấm). Chế độ auto tự tính lại và CHỈ dùng chipPlan
+     * của native khi args.autoChip === false. */
+    var chipPlan = [];
+    var autoPick = null;
+    if (args.autoChip !== false) {
+      autoPick = chooseChipPlan(want, denoms, delay);
+      if (autoPick && autoPick.clicks <= 600) chipPlan = autoPick.plan;
+    }
+    if (!chipPlan.length && Array.isArray(args.chipPlan)) {
+      chipPlan = args.chipPlan.map(function (v) { return Math.round(Number(v) || 0); });
+    }
     if (!chipPlan.length) {
       var fallbackCount = want / guess;
       if (!isFinite(fallbackCount) || fallbackCount < 1 || fallbackCount !== Math.floor(fallbackCount)) {
         return {
           ok: false, reason: 'unrepresentable_amount',
-          note: 'Mệnh giá chip hiện tại không ghép chính xác được mức ' + want + '.'
+          note: 'Không ghép chính xác được mức ' + want + ' bằng các mệnh giá ' +
+            denoms.join('/') + '.',
+          denominations: denoms
         };
       }
       for (var f = 0; f < fallbackCount; f++) chipPlan.push(guess);
@@ -1367,7 +1563,8 @@
         chipPlan.reduce(function (sum, v) { return sum + v; }, 0) !== want) {
       return {
         ok: false, reason: 'unrepresentable_amount',
-        note: 'Tổ hợp chip không khớp chính xác mức cược ' + want + '.'
+        note: 'Tổ hợp chip không khớp chính xác mức cược ' + want + '.',
+        denominations: denoms
       };
     }
     var placeUntil = Date.now() + Math.max(10000, Number(args.placeTimeoutMs) || 10000);
