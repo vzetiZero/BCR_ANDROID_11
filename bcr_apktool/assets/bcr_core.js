@@ -933,6 +933,16 @@
 
     var toggle = revolverToggle();
     if (!toggle) return { ok: false, opened: false, note: 'Không thấy nút mở khay chip.' };
+
+    /* Khay đang MỞ mà vẫn không thấy mệnh giá này (DOM cũ/đang chuyển động):
+     * bấm toggle lúc này sẽ ĐÓNG khay, rồi 900 ms sau vẫn không thấy chip và
+     * bậc cược bị bỏ. Đóng hẳn rồi mở lại để chắc chắn khay ở trạng thái mở. */
+    if (revolverOpen()) {
+      await closeRevolver();
+      map = trayChips();
+      if (map[value] && map[value].onScreen) return { ok: true, opened: false };
+    }
+
     var tp = pointOf(toggle);
     if (!tp || !synthTap({ el: toggle, x: tp.x, y: tp.y })) {
       return { ok: false, opened: false, note: 'Không bấm được nút mở khay chip.' };
@@ -1035,23 +1045,44 @@
 
     if (goodEnough(denoms)) return denoms;
 
+    /* Khay đã MỞ sẵn: mọi mệnh giá đang hiện, bấm toggle lúc này là ĐÓNG khay
+     * → còn thấy ít chip hơn. Không mở gì thêm, dùng những gì đang có. */
+    if (revolverOpen()) {
+      denoms.revolverOpened = true;
+      return denoms;
+    }
+
     var toggle = revolverToggle();
     if (!toggle) return denoms;
     var p = pointOf(toggle);
     if (!p) return denoms;
 
     var before = spotAmount(side);
+    var tapAt = Date.now();
     synthTap({ el: toggle, x: p.x, y: p.y });
     opened = true;
 
-    var until = Date.now() + (Number(timeoutMs) || 900);
-    var grewAt = Date.now();
+    /* Chờ khay bung ra.
+     *
+     * Animation mở khay của EV mất ~250–400 ms và chip hiện dần. Bản trước bỏ
+     * cuộc khi "200 ms không thấy thêm mệnh giá" — tức là bỏ cuộc TRƯỚC khi
+     * animation xong, nên chỉ thấy chip 20 và bậc 2560 thành 128 cú bấm (16 s,
+     * trượt cửa cược). Giờ chỉ bỏ cuộc sau khi đã chờ qua animation VÀ bộ mệnh
+     * giá đứng yên thật sự. */
+    var startAt = Date.now();
+    var until = startAt + (Number(timeoutMs) || 900);
+    var grewAt = startAt;
+    var seen = denoms.length;
     while (Date.now() < until) {
       await sleep(14);
       var now = clickableDenoms();
-      if (now.length > denoms.length) { denoms = now; grewAt = Date.now(); }
-      else if (denoms.length && Date.now() - grewAt > 200) break;
+      if (now.length > seen) {
+        seen = now.length; denoms = now; grewAt = Date.now();
+        // Đo độ trễ mở khay thật của máy này để lần sau tính chi phí cho đúng.
+        toggleMs = Math.max(80, Math.min(900, Date.now() - tapAt));
+      }
       if (goodEnough(denoms)) break;
+      if (Date.now() - startAt > 450 && Date.now() - grewAt > 250) break;
     }
 
     // Mở khay mà tiền trên ô đổi nghĩa là đã lỡ đặt gì đó — báo cho nơi gọi.
@@ -1099,9 +1130,14 @@
 
   /**
    * Chọn tổ hợp chip rẻ nhất về THỜI GIAN cho [amount].
-   * Trả { plan, clicks, cost } hoặc null nếu không ghép chính xác được.
+   *
+   * Trả { plan, clicks, distinct, cost } hoặc null nếu không ghép chính xác được.
+   *
+   * `switchCostMs` là chi phí THẬT của một lần đổi mệnh giá (mở khay + bấm chip,
+   * cộng thêm đóng khay nếu khay che ô cược). `selected` là mệnh giá đang chọn
+   * sẵn — dùng nó không tốn lần đổi nào, nên phải tính là rẻ hơn.
    */
-  function chooseChipPlan(amount, denoms, delayMs) {
+  function chooseChipPlan(amount, denoms, delayMs, switchCostMs, selected) {
     var want = Math.round(Number(amount) || 0);
     if (want <= 0) return null;
     var coins = (denoms || []).map(Math.round).filter(function (v) {
@@ -1112,37 +1148,115 @@
     if (!coins.length) return null;
 
     var perClick = isFinite(delayMs) && delayMs > 0 ? delayMs : 150;
-    var switchCost = 250;
+    var switchCost = isFinite(switchCostMs) && switchCostMs > 0 ? switchCostMs : 250;
+    var current = Math.round(Number(selected) || 0);
+    var maxClicks = 400;
 
+    var seen = {};
     var plans = [];
+    function addPlan(arr) {
+      if (!arr || !arr.length || arr.length > maxClicks) return;
+      var sorted = arr.slice().sort(function (a, b) { return b - a; });
+      var key = sorted.join(',');
+      if (seen[key]) return;
+      seen[key] = 1;
+      plans.push(sorted);
+    }
+
     // 1) Một mệnh giá duy nhất chia hết (0 lần đổi chip).
     for (var i = 0; i < coins.length; i++) {
       if (want % coins[i] !== 0) continue;
       var n = want / coins[i];
-      if (n > 400) continue;
+      if (n > maxClicks) continue;
       var arr = [];
       for (var k = 0; k < n; k++) arr.push(coins[i]);
-      plans.push(arr);
+      addPlan(arr);
     }
-    // 2) Tổ hợp tối thiểu số chip (DP).
-    var dp = minChipPlan(want, coins);
-    if (dp && dp.length) plans.push(dp);
+
+    // 2) Mỗi mệnh giá làm "chủ đạo": lấy tối đa số đồng vừa phải rồi ghép phần
+    //    lẻ còn lại bằng các mệnh giá nhỏ hơn. Đây là họ kế hoạch thực dụng nhất
+    //    khi khay phải mở/đóng nhiều lần (ít mệnh giá > ít cú bấm).
+    for (var a2 = 0; a2 < coins.length; a2++) {
+      var big = coins[a2];
+      var maxCount = Math.floor(want / big);
+      var smaller = coins.filter(function (c) { return c < big; });
+      for (var c2 = maxCount; c2 >= Math.max(0, maxCount - 2); c2--) {
+        var rest = want - c2 * big;
+        if (rest === 0) {
+          var full = [];
+          for (var t2 = 0; t2 < c2; t2++) full.push(big);
+          addPlan(full);
+          continue;
+        }
+        if (!smaller.length) continue;
+        var tail = minChipPlan(rest, smaller);
+        if (!tail) continue;
+        var combo = [];
+        for (var t3 = 0; t3 < c2; t3++) combo.push(big);
+        for (var t4 = 0; t4 < tail.length; t4++) combo.push(tail[t4]);
+        addPlan(combo);
+      }
+    }
+
+    // 3) Tổ hợp tối thiểu số chip trên toàn bộ mệnh giá (DP).
+    addPlan(minChipPlan(want, coins));
+
     if (!plans.length) return null;
 
-    var best = null;
-    var bestCost = Infinity;
+    var scored = [];
     for (var p = 0; p < plans.length; p++) {
       var plan = plans[p];
       var distinct = {};
       for (var q = 0; q < plan.length; q++) distinct[plan[q]] = 1;
-      var switches = Object.keys(distinct).length;
-      var cost = plan.length * perClick + Math.max(0, switches - 1) * switchCost;
-      if (cost < bestCost) { bestCost = cost; best = plan; }
+      var keys = Object.keys(distinct).map(Number);
+      // Mệnh giá đang chọn sẵn không tốn lần đổi nào.
+      var switches = keys.filter(function (v) { return v !== current; }).length;
+      scored.push({
+        plan: plan,
+        clicks: plan.length,
+        distinct: keys.length,
+        cost: plan.length * perClick + switches * switchCost
+      });
     }
+
+    var bestCost = Infinity;
+    for (var s = 0; s < scored.length; s++) {
+      if (scored[s].cost < bestCost) bestCost = scored[s].cost;
+    }
+
+    /* Ưu tiên SỐ CÚ BẤM, rồi mới tới chi phí đổi chip.
+     *
+     * Số cú bấm là đại lượng ĐO ĐƯỢC và là thứ quyết định có kịp cửa cược hay
+     * không. Chi phí đổi chip chỉ là ước lượng (animation mở/đóng khay thay đổi
+     * theo máy). Nếu để chi phí quyết định hoàn toàn thì kế hoạch
+     * 250×10 + 20×3 (13 cú, 2 lần đổi) sẽ "thắng" 1000×2 + 250×2 + 20×3
+     * (7 cú, 3 lần đổi) chỉ vì mỗi cú bấm bị tính quá rẻ — trong khi 13 cú chậm
+     * hơn thật và mỗi cú là một lần chờ site xác nhận.
+     *
+     * Nên: chỉ xét các kế hoạch có số cú bấm sát mức tối thiểu, trong nhóm đó
+     * mới chọn cái ít lần đổi chip / rẻ nhất. */
+    var minClicks = Infinity;
+    for (var v0 = 0; v0 < scored.length; v0++) {
+      if (scored[v0].clicks < minClicks) minClicks = scored[v0].clicks;
+    }
+    var clickLimit = minClicks + Math.max(2, Math.ceil(minClicks * 0.45));
+
+    var best = null;
+    for (var u = 0; u < scored.length; u++) {
+      var c = scored[u];
+      if (c.clicks > clickLimit) continue;
+      if (!best || c.cost < best.cost ||
+          (c.cost === best.cost && c.clicks < best.clicks)) {
+        best = c;
+      }
+    }
+    if (!best) best = scored[0];
+
     return {
-      plan: best.slice().sort(function (a, b) { return b - a; }),
-      clicks: best.length,
-      cost: Math.round(bestCost)
+      plan: best.plan.slice(),
+      clicks: best.clicks,
+      distinct: best.distinct,
+      cost: Math.round(best.cost)
     };
   }
 
@@ -1155,10 +1269,17 @@
     var r = chooseChipPlan(amount, denoms, 150);
     return r ? r.clicks : null;
   }
-
-  /* Ngưỡng "đủ tốt": tối đa chừng này cú thì không cần mở khay chip (mở khay tốn
+  /** Ngưỡng "đủ tốt": tối đa chừng này cú thì không cần mở khay chip (mở khay tốn
    * ~700–900 ms, lớn hơn cả thời gian bấm ở bậc thấp). */
   var GOOD_ENOUGH_CLICKS = 12;
+
+  /* Độ trễ ĐO ĐƯỢC của một lần mở khay chip (ms).
+   *
+   * Đây là biến quyết định lựa chọn giữa "ít mệnh giá" và "ít cú bấm": khi khay
+   * che ô cược thì ĐỔI mệnh giá tốn gấp đôi (mở + đóng), lúc đó thà bấm 16 cú
+   * cùng một mệnh giá còn nhanh hơn 3 lần đổi chip. Giá trị cập nhật sau lần mở
+   * khay đầu tiên, nhờ vậy tự thích nghi với máy nhanh/chậm. */
+  var toggleMs = 260;
 
   /**
    * Ô cược THẬT của một cửa.
@@ -1784,7 +1905,6 @@
 
     var denoms = clickableDenoms();
     if (!denoms.length) denoms = [20, 50, 250, 1000, 5000, 10000];
-
     // Mệnh giá ĐOÁN trước khi bấm (chỉ dùng cho dryRun và cho lời nhắn). Số thật sẽ
     // được đo bằng chip vừa lên bàn ở lần bấm đầu tiên.
     var guess = Number(first.selected_chip) || denoms[0] || want;
@@ -1853,11 +1973,23 @@
     /* --- chọn tổ hợp chip ---
      * Native có thể gửi chipPlan dựa trên mệnh giá nó thấy lúc khay thu gọn (hay chỉ
      * có chip nhỏ → hàng trăm cú bấm). Chế độ auto tự tính lại và CHỈ dùng chipPlan
-     * của native khi args.autoChip === false. */
+     * của native khi args.autoChip === false.
+     *
+     * Chi phí mỗi lần ĐỔI mệnh giá không phải hằng số: khay đang mở mà che ô cược
+     * thì phải đóng khay để bấm ô, rồi mở lại cho mệnh giá sau — tốn gấp đôi.
+     * Vì vậy đưa chi phí thật vào bài toán chọn tổ hợp: khi khay che ô, kế hoạch
+     * "một mệnh giá, nhiều cú" thắng kế hoạch "ba mệnh giá, ít cú". */
+    var coverCost = 0;
+    (function () {
+      var probe = targets.spot && targets.spot.el;
+      if (probe && !spotHitPoint(probe) && revolverOpen()) coverCost = toggleMs;
+    })();
+    var switchCost = toggleMs + 90 + coverCost;
+
     var chipPlan = [];
     var autoPick = null;
     if (args.autoChip !== false) {
-      autoPick = chooseChipPlan(want, denoms, delay);
+      autoPick = chooseChipPlan(want, denoms, delay, switchCost, selectedChip());
       if (autoPick && autoPick.clicks <= 600) chipPlan = autoPick.plan;
     }
     if (!chipPlan.length && Array.isArray(args.chipPlan)) {
