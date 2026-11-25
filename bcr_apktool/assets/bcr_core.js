@@ -631,6 +631,39 @@
   }
 
   /**
+   * Đọc số tiền có PHẦN LẺ (số dư kiểu "9,50" = 9.50, không phải 950).
+   *
+   * digits() chỉ lấy chữ số nên "9,50" thành 950 và "100.000" thành 100000 — dùng
+   * digits() cho số dư là sai gấp 100 lần. Ở đây tách đúng: dấu phân cách mà sau
+   * nó có ĐÚNG 2 chữ số ở cuối là dấu thập phân, còn lại là phân cách nghìn.
+   */
+  function moneyOf(text) {
+    var s = String(text || '')
+      .replace(/[\u2066\u2067\u2068\u2069\u200e\u200f]/g, '')
+      .replace(/(?:VN2|VND|USDT|USD|CNY|THB|KRW|JPY|EUR)/gi, ' ');
+    var m = s.match(/\d[\d.,\s]*/);
+    if (!m) return null;
+    var raw = m[0].replace(/\s+/g, '').replace(/[.,]+$/, '');
+    if (!raw) return null;
+    var lastSep = Math.max(raw.lastIndexOf(','), raw.lastIndexOf('.'));
+    if (lastSep >= 0 && /^\d{2}$/.test(raw.slice(lastSep + 1))) {
+      var whole = raw.slice(0, lastSep).replace(/[.,]/g, '');
+      var frac = raw.slice(lastSep + 1);
+      var v = parseFloat(whole + '.' + frac);
+      return isFinite(v) ? v : null;
+    }
+    var plain = parseFloat(raw.replace(/[.,]/g, ''));
+    return isFinite(plain) ? plain : null;
+  }
+
+  /** Số dư hiện tại (null nếu trang không hiện). */
+  function walletAmount() {
+    var v = moneyOf(walletText());
+    if (v === null) v = moneyOf((document.querySelector('[data-role="balance-value"]') || {}).textContent);
+    return v;
+  }
+
+  /**
    * Hạn mức cược của từng cửa chính, đọc từ bảng "BET LIMITS" của bàn.
    * Bàn thật (Evolution r2) ghi dạng "BANKER⁦VN2 20⁩ – 100,000⁩0.95:1" → lấy số ĐẦU = min,
    * số SAU dấu gạch = max. Trả {} khi bàn không hiện bảng này.
@@ -772,6 +805,186 @@
     return chips[0].parentElement;
   }
 
+  /* Vùng chứa chip có thể bấm được.
+   *
+   * Bàn Evolution (mobile) giấu phần lớn mệnh giá trong "revolver" — một bánh xe
+   * chip CHỈ hiện ra khi bấm nút toggle. Các chip đó KHÔNG nằm trong
+   * `[data-role="chip-stack"]`, nên bản trước (chỉ đọc chip-stack) chỉ thấy 1-2
+   * mệnh giá nhỏ và tưởng bàn chỉ có 20/50.
+   *
+   * Đây chính là lý do bậc 7–8 không đặt nổi: kế hoạch tính ra "128 cú chip 20"
+   * trong khi bàn thật có chip 1000 chỉ cần 7 cú. */
+  function trayChipScopes() {
+    var out = [];
+    [
+      '[data-role="revolver-item-list"]',
+      '[data-role="revolver-overlay"]',
+      '[data-role="chip-stack"]',
+      '[data-role="chip-stack-toggle"]',
+      '[data-role="selected-chip"]'
+    ].forEach(function (sel) {
+      var el = document.querySelector(sel);
+      if (el && out.indexOf(el) < 0) out.push(el);
+    });
+    return out;
+  }
+
+  /** Phần tử có thực sự nằm trong màn hình (chip đóng revolver nằm ở -500,-500). */
+  function onScreen(el, margin) {
+    if (!shown(el)) return false;
+    var r = el.getBoundingClientRect();
+    if (r.width <= 2 || r.height <= 2) return false;
+    var vw = window.innerWidth || 0, vh = window.innerHeight || 0;
+    if (!vw || !vh) return true;
+    var m = margin === undefined ? 2 : margin;
+    // Tự tính các cạnh thay vì dựa vào r.right/r.bottom: một số WebView cũ chỉ trả
+    // x/y/width/height, và `undefined > m` luôn false sẽ làm mọi chip thành "ngoài
+    // màn hình" → không chọn được chip nào.
+    var left = r.x, top = r.y;
+    var right = left + r.width, bottom = top + r.height;
+    return right > m && bottom > m && left < vw - m && top < vh - m;
+  }
+
+  /* Mệnh giá -> phần tử bấm được, ưu tiên chip ĐANG HIỆN trên màn hình rồi mới
+   * tới chip có diện tích lớn nhất (revolver xếp chồng nhiều bản trùng toạ độ). */
+  function trayChips() {
+    var map = {};
+    var scopes = trayChipScopes();
+    for (var s = 0; s < scopes.length; s++) {
+      var els = scopes[s].querySelectorAll('[data-role="chip"][data-value]');
+      for (var i = 0; i < els.length; i++) {
+        var el = els[i];
+        if (!document.contains(el)) continue;
+        var v = parseInt(el.getAttribute('data-value'), 10);
+        if (!isFinite(v) || v <= 0) continue;
+        var r = el.getBoundingClientRect();
+        var visibleNow = onScreen(el);
+        if (r.width <= 2 || r.height <= 2) continue;
+        var cur = map[v];
+        var cand = { el: el, area: r.width * r.height, onScreen: visibleNow };
+        if (!cur) { map[v] = cand; continue; }
+        // Chip đang hiện luôn thắng chip offscreen, kể cả khi nhỏ hơn.
+        if (cand.onScreen !== cur.onScreen) {
+          if (cand.onScreen) map[v] = cand;
+          continue;
+        }
+        if (cand.area > cur.area) map[v] = cand;
+      }
+    }
+    return map;
+  }
+
+  /** Các mệnh giá đang BẤM ĐƯỢC ngay (không cần mở thêm gì). */
+  function trayChipsOnScreen() {
+    var all = trayChips();
+    var out = {};
+    Object.keys(all).forEach(function (k) {
+      if (all[k].onScreen) out[k] = all[k];
+    });
+    return out;
+  }
+
+  /** Revolver đang mở? (≥2 chip mệnh giá cùng hiện trên màn hình) */
+  function revolverOpen() {
+    var shownCount = 0;
+    var map = trayChipsOnScreen();
+    Object.keys(map).forEach(function (k) { if (map[k].onScreen) shownCount += 1; });
+    return shownCount >= 2;
+  }
+
+  /** Nút mở/đóng khay chip. */
+  function revolverToggle() {
+    var el = document.querySelector('[data-role="chip-stack-toggle"]');
+    return el && shown(el) ? el : null;
+  }
+
+  /**
+   * Đóng khay chip nếu đang mở.
+   *
+   * Khay mở có thể che ô cược; đóng lại thì mệnh giá ĐANG CHỌN vẫn giữ nguyên
+   * (chỉ mất danh sách mệnh giá), nên đóng trước khi bấm ô là an toàn.
+   */
+  async function closeRevolver() {
+    if (!revolverOpen()) return { ok: true, closed: false };
+    var toggle = revolverToggle();
+    if (!toggle) return { ok: false, closed: false };
+    var tp = pointOf(toggle);
+    if (!tp) return { ok: false, closed: false };
+    synthTap({ el: toggle, x: tp.x, y: tp.y });
+    var until = Date.now() + 700;
+    while (Date.now() < until) {
+      await sleep(14);
+      if (!revolverOpen()) return { ok: true, closed: true };
+    }
+    return { ok: false, closed: false };
+  }
+
+  /**
+   * Bảo đảm chip mệnh giá [value] đang HIỆN và bấm được.
+   *
+   * Evoluton mobile giấu chip lớn trong "revolver": chỉ hiện sau khi bấm toggle,
+   * và các chip chưa hiện nằm ở toạ độ -500,-500 (bấm vào đó không có tác dụng).
+   * Trả { ok, opened } — `opened` cho biết ta vừa mở khay (nơi gọi cần đóng lại
+   * nếu khay che ô cược).
+   */
+  async function revealChip(value, timeoutMs) {
+    var map = trayChips();
+    if (map[value] && map[value].onScreen) return { ok: true, opened: false };
+
+    var toggle = revolverToggle();
+    if (!toggle) return { ok: false, opened: false, note: 'Không thấy nút mở khay chip.' };
+    var tp = pointOf(toggle);
+    if (!tp || !synthTap({ el: toggle, x: tp.x, y: tp.y })) {
+      return { ok: false, opened: false, note: 'Không bấm được nút mở khay chip.' };
+    }
+
+    var until = Date.now() + (Number(timeoutMs) || 900);
+    while (Date.now() < until) {
+      await sleep(14);
+      var m = trayChips();
+      if (m[value] && m[value].onScreen) return { ok: true, opened: true };
+    }
+    return {
+      ok: false, opened: true,
+      note: 'Đã mở khay nhưng không thấy chip ' + value + ' bấm được.'
+    };
+  }
+
+  /**
+   * Tìm điểm bấm mà tại đó phần tử nhận cú bấm ĐÚNG là chip mệnh giá [value].
+   *
+   * Revolver xếp các chip thành vòng cung và đôi khi chồng lên nhau; bấm đúng tâm
+   * một chip có thể trúng chip khác. Chọn nhầm chip thì tiền đặt sai mệnh giá —
+   * phải thử nhiều điểm trong chip và xác nhận bằng hit-test trước khi bấm.
+   */
+  function chipHitPoint(value, chipEl) {
+    if (!chipEl || !document.contains(chipEl)) return null;
+    var r = chipEl.getBoundingClientRect();
+    if (r.width <= 2 || r.height <= 2) return null;
+    var offsets = [
+      [0.5, 0.5], [0.5, 0.3], [0.5, 0.7], [0.3, 0.5], [0.7, 0.5],
+      [0.35, 0.35], [0.65, 0.35], [0.35, 0.65], [0.65, 0.65]
+    ];
+    for (var i = 0; i < offsets.length; i++) {
+      var x = r.x + r.width * offsets[i][0];
+      var y = r.y + r.height * offsets[i][1];
+      var hit = null;
+      try { hit = document.elementFromPoint(x, y); } catch (e) { hit = null; }
+      if (!hit) continue;
+      // Đi ngược lên tìm [data-role="chip"], rồi so mệnh giá.
+      var node = hit, chipNode = null;
+      for (var up = 0; up < 8 && node; up++) {
+        if (node.getAttribute && node.getAttribute('data-role') === 'chip') { chipNode = node; break; }
+        node = node.parentElement || (node.parentNode && node.parentNode.host) || null;
+      }
+      if (!chipNode) continue;
+      if (parseInt(chipNode.getAttribute('data-value'), 10) === value) {
+        return { x: x, y: y, abs: toTop(x, y) };
+      }
+    }
+    return null;
+  }
+
   /* ======================= TỰ CHỌN MỆNH GIÁ (auto) =======================
    *
    * Người dùng KHÔNG tự chọn chip. Tool đọc hết mệnh giá trong khay rồi ghép tổ
@@ -787,73 +1000,58 @@
     return a;
   }
 
-  /** Đọc mọi mệnh giá đang thấy trong khay/chip đang chọn. */
-  function readTrayDenoms() {
-    var out = [];
-    var seen = {};
-    /* Quét CẢ "revolver" (bánh xe chip của Evolution): các mệnh giá nằm trong
-     * `revolver-chip-item` và thường XẾP CHỒNG cùng toạ độ. Nếu chỉ quét
-     * `chip-stack` thì dễ chỉ thấy 1-2 mệnh giá đang lộ ra, thiếu chip lớn →
-     * phải bấm hàng chục lần cho bậc cao và không kịp cửa cược. */
-    var scopes = [
-      document.querySelector('[data-role="revolver-item-list"]'),
-      document.querySelector('[data-role="revolver-overlay"]'),
-      document.querySelector('[data-role="chip-stack"]'),
-      document.querySelector('[data-role="chip-stack-toggle"]'),
-      document.querySelector('[data-role="selected-chip"]')
-    ];
-    for (var s = 0; s < scopes.length; s++) {
-      var scope = scopes[s];
-      if (!scope) continue;
-      var els = scope.querySelectorAll('[data-role="chip"][data-value]');
-      for (var i = 0; i < els.length; i++) {
-        var el = els[i];
-        if (!shown(el)) continue;
-        var v = parseInt(el.getAttribute('data-value'), 10);
-        if (isFinite(v) && v > 0 && !seen[v]) { seen[v] = 1; out.push(v); }
-      }
-    }
+  /** Mệnh giá bấm được NGAY (đang hiện trên màn hình, không nằm trong revolver đóng). */
+  function clickableDenoms() {
+    var map = trayChipsOnScreen();
+    var out = Object.keys(map).map(Number);
     out.sort(function (a, b) { return a - b; });
     return out;
   }
 
   /**
-   * Mở khay để thấy ĐẦY ĐỦ mệnh giá.
+   * Bảo đảm bộ mệnh giá đang BẤM ĐƯỢC đủ ghép [needValues] nhanh.
    *
-   * Chỉ mở khi THẬT SỰ cần: nếu kế hoạch hiện tại ghép được bằng những mệnh giá
-   * đang thấy thì không mở, vì mỗi lần mở/đóng khay tốn ~900 ms — với bậc thấp
-   * (20/40/80) khoản đó còn lớn hơn cả thời gian bấm chip.
+   * Điểm mấu chốt: chỉ tính chip ĐANG HIỆN trên màn hình. Chip nằm trong revolver
+   * đang đóng có trong DOM nhưng ở toạ độ ngoài màn hình — đếm chúng là "đã có đủ
+   * mệnh giá" thì sẽ KHÔNG mở khay, rồi lúc đặt chỉ dùng được chip nhỏ và bậc cao
+   * phải bấm hàng trăm cú.
    *
-   * Trả mảng mệnh giá (có thể kèm cờ `spotChanged` cho nơi gọi).
+   * Trả mảng mệnh giá BẤM ĐƯỢC; có thể kèm cờ:
+   *   - `spotChanged`: tiền trên ô đổi trong lúc mở khay (đã lỡ đặt gì đó);
+   *   - `revolverOpened`: khay đang MỞ (nơi gọi có thể cần đóng để khỏi che ô).
    */
   async function revealDenominations(side, timeoutMs, needValues) {
-    var denoms = readTrayDenoms();
+    var denoms = clickableDenoms();
+    var opened = false;
 
-    // Đã đủ mệnh giá để ghép [needValues] thì không cần mở khay.
-    if (needValues && needValues.length && denoms.length) {
-      var canCover = needValues.every(function (v) {
-        return denoms.indexOf(v) >= 0 ||
-          denoms.some(function (d) { return v % d === 0; });
+    function goodEnough(list) {
+      if (!needValues || !needValues.length) return true;
+      if (!list.length) return false;
+      return needValues.every(function (v) {
+        var n = planClicks(v, list);
+        return n !== null && n <= GOOD_ENOUGH_CLICKS;
       });
-      if (canCover) return denoms;
     }
-    if (denoms.length >= 6) return denoms;
 
-    var toggle = document.querySelector('[data-role="chip-stack-toggle"]');
-    if (!toggle || !visible(toggle)) return denoms;
+    if (goodEnough(denoms)) return denoms;
+
+    var toggle = revolverToggle();
+    if (!toggle) return denoms;
     var p = pointOf(toggle);
     if (!p) return denoms;
 
     var before = spotAmount(side);
     synthTap({ el: toggle, x: p.x, y: p.y });
+    opened = true;
 
     var until = Date.now() + (Number(timeoutMs) || 900);
     var grewAt = Date.now();
     while (Date.now() < until) {
       await sleep(14);
-      var now = readTrayDenoms();
+      var now = clickableDenoms();
       if (now.length > denoms.length) { denoms = now; grewAt = Date.now(); }
-      else if (denoms.length && Date.now() - grewAt > 160) break;
+      else if (denoms.length && Date.now() - grewAt > 200) break;
+      if (goodEnough(denoms)) break;
     }
 
     // Mở khay mà tiền trên ô đổi nghĩa là đã lỡ đặt gì đó — báo cho nơi gọi.
@@ -861,6 +1059,7 @@
     if (before !== null && after !== null && Math.abs(after - before) > 0.5) {
       denoms.spotChanged = true;
     }
+    denoms.revolverOpened = opened;
     return denoms;
   }
 
@@ -946,6 +1145,20 @@
       cost: Math.round(bestCost)
     };
   }
+
+  /* Số cú bấm phải bấm cho [amount] với bộ mệnh giá [denoms]; null nếu không ghép được.
+   *
+   * Dùng để trả lời đúng một câu: "bộ mệnh giá đang thấy đã ĐỦ TỐT chưa?".
+   * Đừng dùng phép "chia hết": 2560 chia hết cho 20 nhưng như thế là 128 cú bấm —
+   * đủ để trượt cửa cược ở bậc 7–8. */
+  function planClicks(amount, denoms) {
+    var r = chooseChipPlan(amount, denoms, 150);
+    return r ? r.clicks : null;
+  }
+
+  /* Ngưỡng "đủ tốt": tối đa chừng này cú thì không cần mở khay chip (mở khay tốn
+   * ~700–900 ms, lớn hơn cả thời gian bấm ở bậc thấp). */
+  var GOOD_ENOUGH_CLICKS = 12;
 
   /**
    * Ô cược THẬT của một cửa.
@@ -1090,17 +1303,7 @@
         chips: chips
       };
     });
-    var denominations = [];
-    if (tray) {
-      var seen = {};
-      var cells = tray.querySelectorAll('[data-role="chip"]');
-      for (var i = 0; i < cells.length; i++) {
-        if (!visible(cells[i])) continue;
-        var v = parseInt(cells[i].getAttribute('data-value'), 10);
-        if (isFinite(v) && v > 0 && !seen[v]) { seen[v] = 1; denominations.push(v); }
-      }
-      denominations.sort(function (a, b) { return a - b; });
-    }
+    var denominations = clickableDenoms();
     var total = 0;
     ['B', 'P', 'T'].forEach(function (s) { total += (spots[s] && spots[s].amount) || 0; });
     var labelEl = document.querySelector('[data-role="total-bet-label"]');
@@ -1111,6 +1314,7 @@
       spots: spots,
       denominations: denominations,
       limits: betLimits(),
+      balance: walletAmount(),
       total_label: labelEl ? digits(txt(labelEl)) : null,
       betting: {
         B: bettingAvailability('B'),
@@ -1155,25 +1359,18 @@
     var role = { B: 'Banker', P: 'Player', T: 'Tie' }[side];
     var spot = spotOf(side);
     if (!role || !spot) return null;
-    var tray = trayOf();
+    /* Dùng CÙNG nguồn chip với lúc chọn mệnh giá (trayChips): trước đây chỗ này chỉ
+     * quét `chip-stack` nên không thấy chip trong revolver, trong khi chỗ chọn chip
+     * lại tính cả chúng → chọn xong nhưng "không bấm được chip". */
+    var map = trayChips();
     var chips = {};
-    if (tray) {
-      var els = tray.querySelectorAll('[data-role="chip"][data-value]');
-      for (var i = 0; i < els.length; i++) {
-        var el = els[i];
-        if (!visible(el)) continue;
-        var v = parseInt(el.getAttribute('data-value'), 10);
-        if (!isFinite(v) || v <= 0) continue;
-        var r = el.getBoundingClientRect();
-        var area = r.width * r.height;
-        if (chips[v] && chips[v].area >= area) continue;
-        var p = pointOf(el);
-        if (!p) continue;
-        // Giữ THAM CHIẾU element: trên mobile các chip xếp chồng nhau nên nếu chỉ
-        // dùng toạ độ rồi elementFromPoint sẽ bấm nhầm sang chip nằm trên.
-        chips[v] = { el: el, x: p.x, y: p.y, abs: p.abs, area: area };
-      }
-    }
+    Object.keys(map).forEach(function (k) {
+      var v = parseInt(k, 10);
+      var c = map[k];
+      var p = pointOf(c.el);
+      if (!p) return;
+      chips[v] = { el: c.el, x: p.x, y: p.y, abs: p.abs, area: c.area, onScreen: c.onScreen };
+    });
     var sp = pointOf(spot);
     if (!sp) return null;
     return { spot: { el: spot, x: sp.x, y: sp.y, abs: sp.abs }, chips: chips };
@@ -1351,6 +1548,40 @@
     return visible(spot);
   }
 
+  /* Tìm điểm trên ô cược mà THẬT SỰ nhận được cú bấm (không bị khay/popup che).
+   *
+   * Ô cược Evolution đặt `pointer-events: none` và cú bấm rơi vào `<path>` SVG bên
+   * trong, nên phải kiểm tra "phần tử nhận bấm có nằm trong ô cược không" thay vì
+   * so sánh trực tiếp với chính ô.
+   *
+   * Thử nhiều điểm thay vì chỉ tâm: khay chip mở ra có thể che MỘT PHẦN ô cược
+   * (thường phía dưới). Đóng khay để bấm được là sai hướng — khay đóng thì mất
+   * luôn chip lớn vừa mở. Chỉ cần bấm vào phần ô còn lộ ra.
+   */
+  function spotHitPoint(spot) {
+    if (!spot || !document.contains(spot)) return null;
+    var r = spot.getBoundingClientRect();
+    if (r.width <= 2 || r.height <= 2) return null;
+    var offsets = [
+      [0.5, 0.5], [0.5, 0.35], [0.5, 0.2], [0.35, 0.5], [0.65, 0.5],
+      [0.5, 0.65], [0.35, 0.35], [0.65, 0.35], [0.5, 0.8]
+    ];
+    for (var i = 0; i < offsets.length; i++) {
+      var x = r.x + r.width * offsets[i][0];
+      var y = r.y + r.height * offsets[i][1];
+      var hit = null;
+      try { hit = document.elementFromPoint(x, y); } catch (e) { hit = null; }
+      if (!hit) continue;
+      var a = hit;
+      for (var up = 0; up < 8 && a; up++) {
+        if (a === spot) return { x: x, y: y, abs: toTop(x, y) };
+        a = a.parentElement || (a.parentNode && a.parentNode.host) || null;
+      }
+    }
+    return null;
+  }
+
+
   /**
    * Bấm [count] lần vào ô cược, theo lô.
    *
@@ -1367,11 +1598,11 @@
       function round() {
         if (left <= 0) { resolve(taps); return; }
         if (!quickReady(spot)) { resolve(taps); return; }
-        var r = spot.getBoundingClientRect();
-        if (r.width <= 2 || r.height <= 2) { resolve(taps); return; }
-        var x = r.x + r.width / 2;
-        var y = r.y + r.height / 2;
-        var abs = toTop(x, y);
+        var hit = spotHitPoint(spot);
+        if (!hit) { resolve(taps); return; }
+        var x = hit.x;
+        var y = hit.y;
+        var abs = hit.abs;
         var n = Math.min(size, left);
         /* Trong một lô phát lần lượt, cách nhau ~15 ms.
          *
@@ -1401,45 +1632,54 @@
     });
   }
 
-  /** Chọn mệnh giá trong khay — bản nhanh: nhịp 20 ms, thoát ngay khi thấy đổi. */
+  /** Chọn mệnh giá trong khay — mở revolver nếu cần, thoát ngay khi thấy đổi. */
   async function selectTrayChip(side, value, amountBefore) {
-    if (selectedChip() === value) return { ok: true };
+    if (selectedChip() === value) return { ok: true, opened: false };
 
-    var target = targetsFor(side);
-    var chip = target && target.chips[value];
-    if (!chip) {
-      var toggle = document.querySelector('[data-role="chip-stack-toggle"]');
-      var togglePoint = visible(toggle) ? pointOf(toggle) : null;
-      if (!togglePoint || !synthTap({ el: toggle, x: togglePoint.x, y: togglePoint.y })) {
-        return { ok: false, note: 'Không thấy chip ' + value + ' để chọn trực tiếp.' };
+    /* Lấy phần tử từ CÙNG bản đồ mà clickableDenoms dùng, và chỉ chấp nhận chip
+     * đang HIỆN. Chip trong revolver đóng nằm ở -500,-500: bấm vào đó site không
+     * nhận, mà trước đây code vẫn coi là "đã bấm" → bậc cao đặt thiếu chip. */
+    var opened = false;
+    var map = trayChips();
+    if (!map[value] || !map[value].onScreen) {
+      var rev = await revealChip(value, 900);
+      opened = !!rev.opened;
+      if (!rev.ok) return { ok: false, opened: opened, note: rev.note };
+      var afterReveal = spotAmount(side);
+      if (afterReveal === null || Math.abs(afterReveal - amountBefore) > 0.5) {
+        return { ok: false, opened: opened, note: 'Tổng cược đổi trong lúc mở khay; dừng để kiểm tra.' };
       }
-      var revealUntil = Date.now() + 700;
-      while (Date.now() < revealUntil) {
-        target = targetsFor(side);
-        chip = target && target.chips[value];
-        if (chip) break;
-        await sleep(20);
-      }
-      var amountAfterReveal = spotAmount(side);
-      if (amountAfterReveal === null || Math.abs(amountAfterReveal - amountBefore) > 0.5) {
-        return { ok: false, note: 'Tổng cược đổi trong lúc mở khay; dừng để kiểm tra.' };
-      }
+      map = trayChips();
     }
-    if (!chip || !synthTap({ el: chip.el, x: chip.x, y: chip.y })) {
-      return { ok: false, note: 'Không bấm/chọn được chip ' + value + ' trong khay.' };
+
+    var chip = map[value];
+    if (!chip) {
+      return { ok: false, opened: opened, note: 'Không thấy chip ' + value + ' bấm được.' };
+    }
+    /* Xác nhận điểm bấm trúng ĐÚNG chip này (revolver xếp chồng nên tâm chip có
+     * thể là chip khác) — chọn nhầm chip là đặt sai mệnh giá. */
+    var hit = chipHitPoint(value, chip.el);
+    if (!hit) {
+      return {
+        ok: false, opened: opened,
+        note: 'Chip ' + value + ' bị chip khác che, không bấm chắc được.'
+      };
+    }
+    if (!synthTap({ el: chip.el, x: hit.x, y: hit.y })) {
+      return { ok: false, opened: opened, note: 'Không bấm/chọn được chip ' + value + ' trong khay.' };
     }
 
     // Chip đổi trạng thái ngay trong DOM; chỉ cần vài nhịp là biết, không chờ 1,2 s.
     var until = Date.now() + 900;
     while (Date.now() < until) {
-      if (selectedChip() === value) return { ok: true };
+      if (selectedChip() === value) return { ok: true, opened: opened };
       await sleep(16);
     }
     var amountNow = spotAmount(side);
     if (amountNow === null || Math.abs(amountNow - amountBefore) > 0.5) {
-      return { ok: false, note: 'Số tiền trên ô đổi khi chọn chip; dừng để kiểm tra.' };
+      return { ok: false, opened: opened, note: 'Số tiền trên ô đổi khi chọn chip; dừng để kiểm tra.' };
     }
-    return { ok: false, note: 'Chưa xác nhận được chip ' + value + ' sau khi chọn.' };
+    return { ok: false, opened: opened, note: 'Chưa xác nhận được chip ' + value + ' sau khi chọn.' };
   }
 
   /**
@@ -1516,6 +1756,23 @@
       };
     }
 
+    /* Số dư phải đủ cho phần CẦN ĐẶT THÊM (`want`), không phải tổng cả ô.
+     *
+     * Runner gửi `amount` = phần còn thiếu của bậc, và `start` = tiền đã có trên ô.
+     * Thiếu tiền thì site nhận được vài chip đầu rồi chặn giữa chừng → bàn còn chip
+     * dở dang (mất tiền nếu ván chạy) và bậc gấp thếp sau tính sai. Chặn trước. */
+    var wallet = first.balance;
+    if (wallet !== null && wallet !== undefined && isFinite(wallet)) {
+      if (want > wallet + 0.001) {
+        return {
+          ok: false, reason: 'insufficient_balance',
+          note: 'Số dư ' + wallet + ' không đủ cho lệnh ' + want +
+            ' — thiếu ' + Math.round((want - wallet) * 100) / 100 + '.',
+          balance: wallet, want: want
+        };
+      }
+    }
+
     var targets = null;
     while (Date.now() < waitUntil && !targets) {
       targets = targetsFor(side);
@@ -1525,37 +1782,37 @@
       return { ok: false, reason: 'no_targets', note: 'Chưa thấy ô cược/khay chip.' };
     }
 
-    var denoms = (first.denominations && first.denominations.length)
-      ? first.denominations : [20, 50, 250, 1000, 5000, 10000];
+    var denoms = clickableDenoms();
+    if (!denoms.length) denoms = [20, 50, 250, 1000, 5000, 10000];
 
     // Mệnh giá ĐOÁN trước khi bấm (chỉ dùng cho dryRun và cho lời nhắn). Số thật sẽ
     // được đo bằng chip vừa lên bàn ở lần bấm đầu tiên.
     var guess = Number(first.selected_chip) || denoms[0] || want;
 
     /* --- TỰ CHỌN MỆNH GIÁ ---
-     * Người dùng không chọn chip; tool chọn tổ hợp ít tốn thời gian nhất. Ưu tiên
-     * mệnh giá đã thấy trong khay; CHỈ mở khay khi thật sự cần thêm mệnh giá lớn,
-     * vì mỗi lần mở/đóng tốn ~900 ms — lớn hơn cả thời gian bấm ở bậc thấp.
+     * Người dùng không chọn chip; tool chọn tổ hợp ít tốn thời gian nhất.
      *
-     * `need` là mức cần ghép, dùng để quyết định "có cần mở khay không". */
+     * CHỈ dùng mệnh giá ĐỌC ĐƯỢC và BẤM ĐƯỢC từ khay. Bản trước còn gộp thêm danh
+     * sách mặc định (20/50/250/1000/5000/10000/50000) vào — nếu bàn không có mệnh
+     * giá đó (ví dụ 50000) thì kế hoạch chứa chip KHÔNG TỒN TẠI, chọn chip thất bại
+     * và bậc cao không đặt được. Thà bấm nhiều cú với chip có thật.
+     *
+     * Nếu chip đang hiện chưa ghép nổi trong ít cú thì `revealDenominations` mở
+     * revolver để lấy thêm mệnh giá lớn. */
     if (args.autoChip !== false && !args.dryRun) {
       try {
         var richer = await revealDenominations(side, 900, [want]);
-        if (richer && richer.length) denoms = richer.slice();
         if (richer && richer.spotChanged) {
           return {
             ok: false, reason: 'table_changed',
             note: 'Tiền trên ô đổi khi mở khay chip; dừng để kiểm tra.'
           };
         }
+        // Mệnh giá phải bấm được NGAY (chip trong revolver đóng nằm ngoài màn hình).
+        var usable = clickableDenoms();
+        if (usable.length) denoms = usable;
+        else if (richer && richer.length) denoms = richer.slice();
       } catch (e) { /* giữ mệnh giá cũ */ }
-      // Gộp thêm mệnh giá mặc định của EV để ghép được cả bậc lớn.
-      var merge = denoms.slice();
-      [20, 50, 250, 1000, 5000, 10000, 50000].forEach(function (v) {
-        if (merge.indexOf(v) < 0) merge.push(v);
-      });
-      merge.sort(function (a, b) { return a - b; });
-      denoms = merge;
     }
 
     // dryRun: chỉ trả toạ độ các lần bấm ô cược (native bấm cảm ứng thật).
@@ -1642,6 +1899,12 @@
     async function burst(count) {
       var el = liveSpot();
       if (!el) return 0;
+      /* Khay chip mở có thể che ô cược. Chỉ đóng khi ô THẬT SỰ bị che — đóng vô
+       * điều kiện sẽ làm mất danh sách mệnh giá và phải mở lại (tốn ~700 ms) cho
+       * từng mệnh giá trong kế hoạch trộn. */
+      if (!spotHitPoint(el) && revolverOpen()) {
+        await closeRevolver();
+      }
       var done = await tapSpotFast(el, count, delay, batchSize, steps);
       taps += done;
       return done;
