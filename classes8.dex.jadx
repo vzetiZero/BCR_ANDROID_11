@@ -1,0 +1,18 @@
+{
+  "projectVersion": 2,
+  "files": [
+    "BCRAndroid-v1.16_extracted\\classes8.dex"
+  ],
+  "treeExpansionsV2": [],
+  "codeData": {
+    "comments": [],
+    "renames": []
+  },
+  "openTabs": [],
+  "cacheDir": "C:\\Users\\Administrator\\AppData\\Local\\skylot\\jadx\\cache\\projects\\classes8-d938f49cee20f04935c67ba47a1968df",
+  "enableLiveReload": false,
+  "searchHistory": [],
+  "searchResourcesFilter": "$TEXT",
+  "searchResourcesSizeLimit": 0,
+  "pluginOptions": {}
+}

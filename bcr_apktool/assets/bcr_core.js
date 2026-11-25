@@ -2386,6 +2386,139 @@
     return out;
   }
 
+  /* =========================== BẮT KHUNG WEBSOCKET ===========================
+   *
+   * Mục đích: biết CHÍNH XÁC site gửi lệnh đặt cược gì, thay vì suy ra từ DOM.
+   *
+   * Nguyên tắc an toàn (đọc trước khi sửa):
+   *   1. KHÔNG thay `window.WebSocket`. Bản v1.8 từng làm vậy và đứt prototype
+   *      chain → nhà cái đá phiên ngay khi ván bắt đầu. Chỉ bọc ĐÚNG MỘT method
+   *      là `WebSocket.prototype.send`.
+   *   2. Không thay `fetch`, `XMLHttpRequest`, `EventTarget.prototype`.
+   *   3. Mọi lỗi trong bộ bắt bị nuốt: không được để sniffer làm hỏng traffic.
+   *   4. `origSend` được gọi với đúng `this`/arguments và trả nguyên giá trị.
+   *   5. MẶC ĐỊNH TẮT. Chỉ bật khi native gửi lệnh `ws_capture on`.
+   *      Khi tắt, prototype được khôi phục nguyên trạng.
+   *
+   * Giới hạn: chỉ thấy được khung dạng TEXT (JSON). Bàn dùng binary frame thì
+   * cần thêm bước giải mã — hàm này báo rõ `binary: true` để biết.
+   */
+  var wsCapture = {
+    on: false,
+    send: [],      // khung site GỬI ĐI (lệnh cược nằm ở đây)
+    recv: [],      // khung site NHẬN VỀ
+    installed: false,
+    origSend: null,
+    limit: 60
+  };
+
+  function wsPush(bucket, url, data) {
+    var entry = { t: Date.now(), url: '' };
+    try { entry.url = String(url || '').slice(0, 200); } catch (e) { entry.url = ''; }
+    if (typeof data === 'string') {
+      entry.text = data.length > 4000 ? data.slice(0, 4000) + '…' : data;
+      entry.bytes = data.length;
+      entry.binary = false;
+    } else {
+      entry.binary = true;
+      entry.bytes = 0;
+      try { entry.bytes = (data && data.byteLength) || (data && data.length) || 0; } catch (e) {}
+      entry.text = '';
+      try {
+        var bl = data;
+        if (bl && typeof bl.arrayBuffer === 'function') {
+          entry.note = 'Blob';
+        } else if (bl) {
+          var u8 = new Uint8Array(bl.buffer || bl, bl.byteOffset || 0,
+            Math.min(entry.bytes || 0, 512));
+          var hex = '';
+          for (var i = 0; i < u8.length; i++) {
+            hex += ('0' + u8[i].toString(16)).slice(-2);
+          }
+          entry.hex = hex;
+        }
+      } catch (e) { /* bỏ qua */ }
+    }
+    bucket.push(entry);
+    if (bucket.length > wsCapture.limit) bucket.shift();
+  }
+
+  function wsInstall() {
+    if (wsCapture.installed) return true;
+    try {
+      var WS = window.WebSocket;
+      if (!WS || !WS.prototype || typeof WS.prototype.send !== 'function') return false;
+      var proto = WS.prototype;
+      var orig = proto.send;
+      wsCapture.origSend = orig;
+
+      proto.send = function (data) {
+        /* Bọc trong try/catch: bất kỳ lỗi nào của bộ bắt cũng KHÔNG được làm
+         * hỏng cú gửi của trang. Đây là điều kiện sống còn. */
+        try {
+          if (wsCapture.on) wsPush(wsCapture.send, this && this.url, data);
+        } catch (e) { /* nuốt */ }
+        return orig.apply(this, arguments);
+      };
+
+      /* Nhận về: bọc addEventListener + onmessage của riêng instance. Không bọc
+       * EventTarget.prototype để tránh ảnh hưởng toàn trang. */
+      var origAdd = proto.addEventListener;
+      if (typeof origAdd === 'function') {
+        proto.addEventListener = function (type, fn, opts) {
+          try {
+            if (wsCapture.on && type === 'message' && typeof fn === 'function') {
+              var self = this;
+              var wrapped = function (ev) {
+                try {
+                  if (wsCapture.on) wsPush(wsCapture.recv, self && self.url, ev && ev.data);
+                } catch (e) { /* nuốt */ }
+                return fn.apply(this, arguments);
+              };
+              return origAdd.call(this, type, wrapped, opts);
+            }
+          } catch (e) { /* nuốt */ }
+          return origAdd.apply(this, arguments);
+        };
+      }
+
+      wsCapture.installed = true;
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function wsUninstall() {
+    if (!wsCapture.installed) return;
+    try {
+      if (wsCapture.origSend) window.WebSocket.prototype.send = wsCapture.origSend;
+    } catch (e) { /* bỏ qua */ }
+    wsCapture.installed = false;
+    wsCapture.origSend = null;
+  }
+
+  function wsReport(args) {
+    var direction = String((args && args.dir) || 'send').toLowerCase();
+    var bucket = direction === 'recv' ? wsCapture.recv : wsCapture.send;
+    var out = bucket.slice();
+    if (args && args.pattern) {
+      var needle = String(args.pattern).toLowerCase();
+      out = out.filter(function (e) {
+        return String(e.text || '').toLowerCase().indexOf(needle) >= 0;
+      });
+    }
+    if (args && args.clear) bucket.length = 0;
+    return {
+      ok: true,
+      capturing: wsCapture.on,
+      installed: wsCapture.installed,
+      dir: direction,
+      count: out.length,
+      frames: out
+    };
+  }
+
   /* ================================ điều phối lệnh ================================ */
 
   function run(cmd, args) {
@@ -2414,6 +2547,31 @@
         return { ok: false, reason: 'removed', note: 'Dùng lệnh road.' };
       case 'probe':
         return probeTable();
+      case 'ws_capture':
+        /* Bật/tắt bộ bắt khung WebSocket (mặc định TẮT).
+         *   { on: true }  -> cài bộ bọc send/addEventListener
+         *   { on: false } -> khôi phục prototype nguyên trạng
+         * Trả trạng thái thật sau khi thao tác để native biết có cài được không. */
+        if (args && args.on === false) {
+          wsCapture.on = false;
+          wsUninstall();
+        } else if (args && args.on === true) {
+          wsCapture.on = true;
+          wsInstall();
+        }
+        return {
+          ok: true,
+          capturing: wsCapture.on,
+          installed: wsCapture.installed,
+          send: wsCapture.send.length,
+          recv: wsCapture.recv.length,
+          note: wsCapture.installed
+            ? 'Đang bắt khung WebSocket.'
+            : 'Chưa cài được (không thấy WebSocket hoặc đã bị chặn).'
+        };
+      case 'ws_frames':
+        /* Đọc khung đã bắt. { dir:'send'|'recv', pattern, clear } */
+        return wsReport(args);
       case 'place':
         return placeBet(args);
       case 'open_tile':

@@ -5059,6 +5059,19 @@
     .line 41
     invoke-super {p0, p1}, Landroidx/appcompat/app/AppCompatActivity;->onCreate(Landroid/os/Bundle;)V
 
+    # Bật WebView DevTools để đọc được khung WebSocket từ MÁY TÍNH qua CDP
+    # (chrome://inspect, hoặc adb forward + Network.webSocketFrameSent).
+    #
+    # Chỉ là cờ debug của WebView: KHÔNG chèn gì vào trang, KHÔNG thay
+    # WebSocket/fetch hay bất kỳ API nào của site. Nhờ vậy đọc được đúng lệnh
+    # cược site gửi đi mà không tạo dấu hiệu lạ cho server — khác hẳn cách hook
+    # window.WebSocket (bản v1.8 từng làm đứt prototype chain và bị đá phiên).
+    #
+    # Tắt bằng cách đổi 0x1 -> 0x0.
+    const/4 v11, 0x1
+
+    invoke-static {v11}, Landroid/webkit/WebView;->setWebContentsDebuggingEnabled(Z)V
+
     .line 43
     new-instance v0, Lcom/bcr/android/core/SitePrefs;
 
