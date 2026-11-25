@@ -960,32 +960,124 @@
     return true;
   }
 
-  /**
-   * Chờ ô cược ỔN ĐỊNH rồi trả mức tăng so với mốc [start].
+  /* ==================== đọc ô cược / khay chip TỐC ĐỘ CAO ====================
    *
-   * Sau mỗi lần bấm, site vẽ chip vào ô qua React nên số tiền nhảy vài nhịp. Đọc ngay
-   * sẽ ra số dở dang; đọc khi đã đứng yên 320 ms mới là số chip thật trên bàn.
+   * Bản cũ chờ 110 ms mỗi nhịp đọc và đòi ô cược ĐỨNG YÊN 320 ms mới chấp nhận số
+   * mới, nên mỗi cụm bấm tốn tối thiểu ~430 ms; cộng lần bấm đo mệnh giá (tới 2,6 s)
+   * là quá chậm cho bàn EV có cửa cược ngắn (Speed / VIP / mốc cao).
+   *
+   * Ở đây:
+   *   - đọc bằng requestAnimationFrame (~16 ms/nhịp) thay vì setTimeout 110 ms;
+   *   - thoát NGAY khi số tiền chạm mức cần đặt, không chờ đứng yên;
+   *   - bấm theo LÔ trong cùng một task rồi nhả event loop đúng `delay` ms;
+   *   - kiểm tra ô cược bằng phép rẻ (quickReady) thay vì quét popup mỗi cú bấm.
    */
-  async function settleDelta(side, start, ms) {
-    var until = Date.now() + ms;
-    var last = spotAmount(side);
-    var lastChange = Date.now();
-    while (Date.now() < until) {
-      await sleep(110);
-      var now = spotAmount(side);
-      if (now === null) continue;
-      if (now !== last) {
-        last = now;
-        lastChange = Date.now();
-      } else if (last - start > 0.5 && Date.now() - lastChange >= 320) {
-        break;
-      }
-    }
-    var fin = spotAmount(side);
-    if (fin === null) fin = last;
-    return (fin === null) ? 0 : fin - start;
+
+  /* Hiển thị kiểu RẺ: chỉ dựa vào layout, không gọi getComputedStyle.
+   * Bản đầy đủ `visible()` được gọi ở nơi khác; trong vòng lặp 60fps thì
+   * getComputedStyle cho mỗi chip làm chậm cả khung hình. */
+  function shown(el) {
+    if (!el) return false;
+    if (el.offsetParent === null && el.getClientRects().length === 0) return false;
+    return true;
   }
 
+  function amountOfSpot(spot) {
+    if (!spot || !document.contains(spot)) return null;
+    var total = 0;
+    var els = spot.querySelectorAll('[data-role="chip"]');
+    for (var i = 0; i < els.length; i++) {
+      var el = els[i];
+      if (!shown(el)) continue;
+      var v = parseInt(el.getAttribute('data-value'), 10);
+      if (isFinite(v) && v > 0) total += v;
+    }
+    return total;
+  }
+
+  function frame(fn) {
+    if (typeof requestAnimationFrame === 'function') { requestAnimationFrame(fn); return; }
+    setTimeout(fn, 16);
+  }
+
+  /**
+   * Chờ ô cược nhích lên rồi trả TỔNG mức tăng so với [start].
+   *
+   * opts.reach   : thoát ngay khi đạt mức này (không chờ đứng yên) — dùng khi đã biết
+   *                trước số tiền cần đặt, tiết kiệm vài trăm ms mỗi cụm.
+   * opts.quietMs : thời gian đứng yên tối thiểu khi không có mức đích rõ ràng.
+   */
+  function quickDelta(side, start, opts) {
+    opts = opts || {};
+    var quietMs = opts.quietMs === undefined ? 80 : opts.quietMs;
+    var timeoutMs = opts.timeoutMs || 900;
+    var until = Date.now() + timeoutMs;
+    return new Promise(function (resolve) {
+      var spot = spotOf(side);
+      if (!spot) { resolve(0); return; }
+      var last = amountOfSpot(spot);
+      if (last === null) { resolve(0); return; }
+      var lastChange = Date.now();
+      var sawChange = false;
+      function pollNow() {
+        var now = amountOfSpot(spot);
+        if (now === null) { resolve(0); return; }
+        var gained = now - start;
+        if (now !== last) { last = now; lastChange = Date.now(); sawChange = true; }
+        if (opts.reach !== undefined && gained >= opts.reach - 0.5) { resolve(gained); return; }
+        if (sawChange && gained > 0.5 && Date.now() - lastChange >= quietMs) { resolve(gained); return; }
+        if (Date.now() >= until) { resolve(Math.max(0, gained)); return; }
+        frame(pollNow);
+      }
+      frame(pollNow);
+    });
+  }
+
+  /* Kiểm tra RẺ cho từng cú bấm: chỉ nhìn ô cược, không quét popup/khay chip. */
+  function quickReady(spot) {
+    if (!spot || !document.contains(spot)) return false;
+    if (spot.hasAttribute('disabled') || spot.getAttribute('aria-disabled') === 'true' ||
+        spot.getAttribute('data-disabled') === 'true') return false;
+    if (/(^|[\s_-])(disabled|inactive|closed|locked)([\s_-]|$)/i.test(String(spot.className || ''))) return false;
+    return visible(spot);
+  }
+
+  /**
+   * Bấm [count] lần vào ô cược, theo lô.
+   *
+   * Gửi vài cú trong CÙNG một task rồi nhả event loop đúng [delay] ms: React gộp
+   * render một lần nên nhanh hơn hẳn kiểu await từng cú 40 ms, mà vẫn không dồn cả
+   * chục cú vào một khung hình (site dễ bỏ qua khi đang chạy animation chip).
+   * Trả về số cú đã bấm THẬT (dừng sớm nếu ô cược bị khóa/đổi).
+   */
+  function tapSpotFast(spot, count, delay, batchSize, steps) {
+    var taps = 0;
+    return new Promise(function (resolve) {
+      var left = count;
+      var size = Math.max(1, Math.min(12, batchSize || 5));
+      function round() {
+        if (left <= 0) { resolve(taps); return; }
+        if (!quickReady(spot)) { resolve(taps); return; }
+        var r = spot.getBoundingClientRect();
+        if (r.width <= 2 || r.height <= 2) { resolve(taps); return; }
+        var x = r.x + r.width / 2;
+        var y = r.y + r.height / 2;
+        var abs = toTop(x, y);
+        var n = Math.min(size, left);
+        for (var i = 0; i < n; i++) {
+          taps += 1;
+          steps.push({ kind: 'spot', n: taps, x: x, y: y, abs: abs });
+          synthTap({ el: spot, x: x, y: y });
+        }
+        left -= n;
+        if (left <= 0) { resolve(taps); return; }
+        setTimeout(round, delay);
+      }
+      round();
+    });
+  }
+
+  /** Chọn mệnh giá trong khay — bản nhanh: nhịp 20 ms, thoát ngay khi thấy đổi. */
   async function selectTrayChip(side, value, amountBefore) {
     if (selectedChip() === value) return { ok: true };
 
@@ -997,16 +1089,12 @@
       if (!togglePoint || !synthTap({ el: toggle, x: togglePoint.x, y: togglePoint.y })) {
         return { ok: false, note: 'Không thấy chip ' + value + ' để chọn trực tiếp.' };
       }
-      var amountAfterToggle = spotAmount(side);
-      if (amountAfterToggle === null || Math.abs(amountAfterToggle - amountBefore) > 0.5) {
-        return { ok: false, note: 'Ô cược đổi khi mở khay chip; dừng để kiểm tra.' };
-      }
-      var revealUntil = Date.now() + 900;
+      var revealUntil = Date.now() + 700;
       while (Date.now() < revealUntil) {
         target = targetsFor(side);
         chip = target && target.chips[value];
         if (chip) break;
-        await sleep(40);
+        await sleep(20);
       }
       var amountAfterReveal = spotAmount(side);
       if (amountAfterReveal === null || Math.abs(amountAfterReveal - amountBefore) > 0.5) {
@@ -1017,14 +1105,15 @@
       return { ok: false, note: 'Không bấm/chọn được chip ' + value + ' trong khay.' };
     }
 
-    var until = Date.now() + 1200;
+    // Chip đổi trạng thái ngay trong DOM; chỉ cần vài nhịp là biết, không chờ 1,2 s.
+    var until = Date.now() + 900;
     while (Date.now() < until) {
-      var amountNow = spotAmount(side);
-      if (amountNow === null || Math.abs(amountNow - amountBefore) > 0.5) {
-        return { ok: false, note: 'Số tiền trên ô đổi khi chọn chip; dừng để kiểm tra.' };
-      }
       if (selectedChip() === value) return { ok: true };
-      await sleep(40);
+      await sleep(16);
+    }
+    var amountNow = spotAmount(side);
+    if (amountNow === null || Math.abs(amountNow - amountBefore) > 0.5) {
+      return { ok: false, note: 'Số tiền trên ô đổi khi chọn chip; dừng để kiểm tra.' };
     }
     return { ok: false, note: 'Chưa xác nhận được chip ' + value + ' sau khi chọn.' };
   }
@@ -1037,13 +1126,16 @@
    * Mức chip do người dùng chọn sẵn trên trang (mặc định 20); mỗi lần bấm ô cược là
    * đúng một chip mệnh giá đó.
    *
-   * Số lần bấm = tiền cần đặt / mệnh giá chip. Lần bấm ĐẦU dùng để ĐO mệnh giá thật
-   * (đọc số chip vừa lên bàn) nên không phụ thuộc vào việc trang có đánh dấu chip đang
-   * chọn hay không; các lần sau bấm theo cụm rồi kiểm tra lại ô cược.
+   * Tốc độ: nếu mệnh giá chip đang chọn đọc được tin cậy và khớp kế hoạch thì bấm
+   * luôn cả cụm (không tốn lần bấm "đo"); chỉ khi kế hoạch trộn mệnh giá hoặc không
+   * đọc được chip đang chọn mới bấm 1 cú để đo. Cuối cụm đọc bằng quickDelta với
+   * mức đích rõ ràng nên thoát ngay khi đủ tiền.
    *
-   * args: {side, amount, dryRun, clickDelayMs, waitMs, waitClearMs, placeTimeoutMs, requireClear}
+   * args: {side, amount, dryRun, chipPlan, clickDelayMs, batchSize, fastTap,
+   *        waitMs, waitClearMs, placeTimeoutMs, requireClear}
    */
   async function placeBet(args) {
+    var t0 = Date.now();
     var side = String(args.side || '').toUpperCase();
     var want = Math.round(Number(args.amount) || 0);
     var role = { B: 'Banker', P: 'Player', T: 'Tie' }[side];
@@ -1061,7 +1153,7 @@
       first = readChips();
       if (first.has_table) break;
       first = null;
-      await sleep(150);
+      await sleep(100);
     }
     if (!first) {
       return { ok: false, reason: 'no_table_view', note: 'Khung này không có khay chip/ô cược.' };
@@ -1074,7 +1166,7 @@
       while (Date.now() < clearUntil) {
         var live = readChips();
         if (live && live.has_table && (live.total || 0) <= 0) { cleared = true; break; }
-        await sleep(220);
+        await sleep(80);
       }
       if (!cleared) {
         return {
@@ -1103,7 +1195,7 @@
     var targets = null;
     while (Date.now() < waitUntil && !targets) {
       targets = targetsFor(side);
-      if (!targets) await sleep(120);
+      if (!targets) await sleep(100);
     }
     if (!targets) {
       return { ok: false, reason: 'no_targets', note: 'Chưa thấy ô cược/khay chip.' };
@@ -1131,7 +1223,14 @@
       };
     }
 
-    var delay = Math.max(40, Math.min(200, Number(args.clickDelayMs) || 40));
+    /* --- tốc độ --- */
+    // clickDelayMs của native (mặc định 40) được coi là mức TRẦN; chế độ nhanh hạ
+    // xuống tối đa 12 ms giữa các lô, trong mỗi lô bấm liền một task.
+    var rawDelay = Number(args.clickDelayMs);
+    var delay = isFinite(rawDelay) ? Math.max(0, Math.min(120, rawDelay)) : 8;
+    if (args.fastTap !== false) delay = Math.min(delay, 12);
+    var batchSize = Math.max(1, Math.min(12, Number(args.batchSize) || 5));
+
     var start = spotAmount(side);
     if (start === null) {
       return { ok: false, reason: 'no_targets', note: 'Không đọc được ô ' + role + '.' };
@@ -1160,28 +1259,27 @@
 
     var steps = [];
     var taps = 0;
-    var unit = 0;
     var unavailable = null;
 
-    /* Một lần bấm vào ô cược hiện tại. */
-    function tapSpot() {
-      var state = bettingAvailability(side);
-      if (!state.ready) {
-        unavailable = state;
-        return null;
-      }
-      var spot = spotOf(side);
-      if (!spot) return null;
-      var p = pointOf(spot);
-      if (!p) return null;
-      taps += 1;
-      steps.push({ kind: 'spot', n: taps, x: p.x, y: p.y, abs: p.abs });
-      synthTap({ el: spot, x: p.x, y: p.y });
-      return p;
+    // Ô cược có thể bị React thay element; giữ tham chiếu và làm mới khi cần.
+    var spotEl = targets.spot.el;
+    function liveSpot() {
+      if (spotEl && document.contains(spotEl) && visible(spotEl)) return spotEl;
+      spotEl = spotOf(side);
+      return spotEl;
+    }
+    async function burst(count) {
+      var el = liveSpot();
+      if (!el) return 0;
+      var done = await tapSpotFast(el, count, delay, batchSize, steps);
+      taps += done;
+      return done;
     }
 
     var currentSelection = selectedChip();
     var mixedPlan = chipPlan.some(function (value) { return value !== currentSelection; });
+
+    /* ---------- A) kế hoạch TRỘN mệnh giá: chọn từng mệnh giá rồi bấm ---------- */
     if (mixedPlan) {
       var actualMixed = 0;
       var grouped = {};
@@ -1200,14 +1298,16 @@
           };
         }
 
-        for (var c = 0; c < count && taps < 600; c++) {
-          if (!tapSpot()) break;
-          await sleep(delay);
-        }
-        var gainedMixed = await settleDelta(
-          side, start, 700 + count * Math.max(80, delay)
-        );
-        if (unavailable) {
+        await burst(count);
+        var gainedMixed = await quickDelta(side, start, {
+          reach: want, quietMs: 90,
+          timeoutMs: 500 + count * (delay + 24)
+        });
+        if (gainedMixed + 0.5 < actualMixed) gainedMixed = actualMixed;
+
+        var checkMixed = quickReady(liveSpot()) ? null : bettingAvailability(side);
+        if (checkMixed && !checkMixed.ready) {
+          unavailable = checkMixed;
           return {
             ok: false, reason: gainedMixed > 0 ? 'bet_interrupted' : unavailable.reason,
             note: unavailable.note + (gainedMixed > 0 ? ' Đã đặt một phần; cần kiểm tra bàn.' : ''),
@@ -1249,54 +1349,77 @@
         note: 'Đã đặt chính xác ' + actualMixed + ' vào ' + role + ' (' +
           chipPlan.join(' + ') + ').',
         want: want, actual: actualMixed, rounded: false,
-        unit: currentSelection, taps: taps, steps: steps, spot_after: start + actualMixed
+        unit: currentSelection, taps: taps, steps: steps, spot_after: start + actualMixed,
+        elapsed_ms: Date.now() - t0
       };
     }
 
-    // ---- 1) Lần bấm ĐẦU: đo mệnh giá chip đang chọn bằng chip thật lên bàn.
-    if (!tapSpot()) {
-      if (unavailable) {
-        return { ok: false, reason: unavailable.reason, note: unavailable.note, actual: 0, taps: taps };
-      }
-      return { ok: false, reason: 'no_targets', note: 'Ô ' + role + ' biến mất giữa chừng.' };
-    }
-    unit = await settleDelta(side, start, 2600);
-    if (unit <= 0) {
-      return {
-        ok: false, reason: 'tap_not_registered', needs_real_touch: true,
-        note: 'Bấm ô ' + role + ' nhưng chưa thấy chip lên bàn. Kiểm tra: ô cược có bị che ' +
-          'không, cửa sổ cược đã mở chưa, và trên trang đã chọn mức chip chưa.',
-        want: want, taps: taps, steps: steps
-      };
+    /* ---------- B) MỘT mệnh giá: bấm nhanh nhất có thể ---------- */
+
+    // Nếu chip đang chọn đọc được tin cậy và khớp kế hoạch thì KHÔNG cần bấm đo:
+    // bấm luôn cả cụm, chỉ kiểm tra lại cuối. Thiếu thì mới đo rồi bù.
+    var unit = 0;
+    if (isFinite(currentSelection) && currentSelection > 0 && currentSelection === chipPlan[0]) {
+      unit = currentSelection;
     }
 
-    // ---- 2) Bấm phần còn lại theo cụm, cuối mỗi cụm đọc lại ô cược thật.
-    var actual = unit;
-    var guard = 0;
-    while (actual + 0.5 < want && guard < 40 && taps < 600 && Date.now() < placeUntil) {
-      guard += 1;
-      var need = want - actual;
-      var burst = Math.max(1, Math.min(Math.ceil(need / unit), 40));
-      for (var i = 0; i < burst && taps < 600; i++) {
-        if (!tapSpot()) break;
-        await sleep(delay);
-      }
-      var gained = await settleDelta(side, start, 700 + burst * Math.max(80, delay));
-      if (unavailable) {
-        var partial = Math.max(0, gained);
+    var actual = 0;
+    if (unit > 0) {
+      await burst(chipPlan.length);
+      actual = await quickDelta(side, start, {
+        reach: want, quietMs: 100,
+        timeoutMs: 500 + chipPlan.length * (delay + 26)
+      });
+    } else {
+      // Bấm 1 cú để ĐO mệnh giá thật rồi bù phần còn lại ngay trong cùng lượt.
+      await burst(1);
+      unit = await quickDelta(side, start, { quietMs: 90, timeoutMs: 900 });
+      if (unit <= 0) {
         return {
-          ok: false,
-          reason: partial > 0 ? 'bet_interrupted' : unavailable.reason,
-          note: unavailable.note + (partial > 0 ? ' Đã thấy chip lên một phần; cần kiểm tra bàn.' : ''),
-          want: want, actual: partial, unit: unit, taps: taps, steps: steps
+          ok: false, reason: 'tap_not_registered', needs_real_touch: true,
+          note: 'Bấm ô ' + role + ' nhưng chưa thấy chip lên bàn. Kiểm tra: ô cược có bị che ' +
+            'không, cửa sổ cược đã mở chưa, và trên trang đã chọn mức chip chưa.',
+          want: want, taps: taps, steps: steps
         };
       }
+      var needNow = Math.max(0, Math.round((want - unit) / unit));
+      if (needNow > 0) await burst(needNow);
+      actual = await quickDelta(side, start, {
+        reach: want, quietMs: 100,
+        timeoutMs: 500 + needNow * (delay + 26)
+      });
+    }
+
+    // Bù thêm nếu site bỏ qua vài cú (animation chip / mạng chậm).
+    var guard = 0;
+    while (actual + 0.5 < want && guard < 12 && taps < 600 && Date.now() < placeUntil) {
+      guard += 1;
+      var need = want - actual;
+      var burstCount = Math.max(1, Math.min(Math.ceil(need / (unit || 1)), 40));
+      var before = taps;
+      await burst(burstCount);
+      if (taps === before) break;
+      var gained = await quickDelta(side, start, {
+        reach: want, quietMs: 100,
+        timeoutMs: 400 + burstCount * (delay + 26)
+      });
       if (gained <= actual + 0.5) {
-        if (Date.now() >= placeUntil) break;
-        await sleep(250);
+        await sleep(120);
         continue;
       }
       actual = gained;
+    }
+
+    if (!quickReady(liveSpot())) {
+      unavailable = bettingAvailability(side);
+    }
+    if (unavailable && !unavailable.ready) {
+      return {
+        ok: false,
+        reason: actual > 0 ? 'bet_interrupted' : unavailable.reason,
+        note: unavailable.note + (actual > 0 ? ' Đã thấy chip lên một phần; cần kiểm tra bàn.' : ''),
+        want: want, actual: actual, unit: unit, taps: taps, steps: steps
+      };
     }
 
     if (actual + 0.5 < want) {
@@ -1315,7 +1438,8 @@
     }
     return {
       ok: true, note: note, want: want, actual: actual, rounded: actual !== want,
-      unit: unit, taps: taps, steps: steps, spot_after: start + actual
+      unit: unit, taps: taps, steps: steps, spot_after: start + actual,
+      elapsed_ms: Date.now() - t0
     };
   }
 
