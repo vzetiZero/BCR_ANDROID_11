@@ -229,6 +229,74 @@
     return node;
   }
 
+  /* ------------------------- đọc state React của trang -------------------------
+   *
+   * Trang là React: mỗi element có khoá `__reactFiber$xxx` trỏ vào fiber, và
+   * `memoizedProps` chứa ĐÚNG số tiền đang đặt — không phải con số vẽ ra màn hình.
+   *
+   * Đây là nguồn chính xác nhất: cộng `data-value` các chip trong DOM có thể sai khi
+   * site đang chạy animation (chip cũ chưa gỡ, chip mới đã vẽ, hoặc chỉ vẽ chip trên
+   * cùng kèm nhãn tổng). Fiber thì luôn là state thật mà site sẽ gửi đi.
+   */
+  function reactFiberOf(el) {
+    if (!el) return null;
+    var key = Object.keys(el).filter(function (n) {
+      return n.indexOf('__reactFiber$') === 0 || n.indexOf('__reactInternalInstance$') === 0;
+    })[0];
+    return key ? el[key] : null;
+  }
+
+  /* Chỉ những tên prop THẬT SỰ là "tổng tiền đang đặt" trên ô này.
+   *
+   * Bản nháp trước dùng /amount|total|stake|bet|value|sum/ nên khớp cả `value` (mệnh
+   * giá chip), `betId`, và đi ngược 25 tầng fiber nên có thể chạm component của bàn
+   * khác → đọc ra số tiền của ô khác. Sai kiểu đó khiến app tưởng "đã đặt đủ" rồi
+   * dừng giữa chừng, hoặc tệ hơn là bấm bù quá mức. Giờ khớp CHÍNH XÁC tên. */
+  var STRICT_AMOUNT_KEYS = [
+    'amount', 'betamount', 'totalamount', 'stake', 'totalstake',
+    'bettotal', 'totalbet', 'placedamount', 'betvalue', 'totalvalue',
+    'spotamount', 'chipamount'
+  ];
+
+  function strictAmountIn(obj) {
+    if (!obj || typeof obj !== 'object') return null;
+    var keys = Object.keys(obj);
+    for (var i = 0; i < keys.length && i < 80; i++) {
+      var k = keys[i].toLowerCase();
+      if (STRICT_AMOUNT_KEYS.indexOf(k) < 0) continue;
+      var v = obj[keys[i]];
+      if (typeof v === 'number' && isFinite(v) && v >= 0) return v;
+    }
+    return null;
+  }
+
+  /**
+   * Số tiền THẬT đang đặt trên một ô cược, đọc từ React state.
+   *
+   * Chỉ đi tối đa 6 tầng fiber (phần tử ô cược và vài cha gần nhất) để không lạc sang
+   * component của ô/bàn khác. Trả null khi không chắc chắn.
+   */
+  function reactAmountOf(spot) {
+    try {
+      var f = reactFiberOf(spot);
+      for (var i = 0; f && i < 6; i++) {
+        var props = f.memoizedProps;
+        if (props && typeof props === 'object') {
+          var direct = strictAmountIn(props);
+          if (direct !== null) return direct;
+          // Dạng bọc: { bet: { amount } }, { spot: { total } }, { state: { amount } }…
+          var holders = [props.bet, props.spot, props.state, props.data, props.betSpot];
+          for (var h = 0; h < holders.length; h++) {
+            var n = strictAmountIn(holders[h]);
+            if (n !== null) return n;
+          }
+        }
+        f = f.return;
+      }
+    } catch (e) { /* fiber bị cắt: dùng DOM */ }
+    return null;
+  }
+
   function bestGrouping(nodes, from, to, minSize) {
     var best = null;
     for (var levels = from; levels <= to; levels++) {
@@ -704,14 +772,39 @@
     return chips[0].parentElement;
   }
 
+  /**
+   * Ô cược THẬT của một cửa.
+   *
+   * Trang có thể giữ CẢ layout desktop lẫn mobile trong DOM (cùng data-role), và ô
+   * hiện ra vẫn có thể bị lớp phủ che. Bản cũ lấy phần tử ĐẦU TIÊN thấy được nên có
+   * lúc bấm vào ô của layout ẩn → cú bấm rơi vào hư không.
+   *
+   * Giờ chọn theo: hiện + diện tích lớn nhất, rồi xác nhận bằng elementFromPoint
+   * rằng tâm ô thực sự nhận cú bấm.
+   */
   function spotOf(side) {
     var role = { B: 'Banker', P: 'Player', T: 'Tie' }[side];
     if (!role) return null;
     var spots = document.querySelectorAll('[data-role="bet-spot-' + role + '"]');
+    var pool = [];
     for (var i = 0; i < spots.length; i++) {
-      if (visible(spots[i])) return spots[i];
+      var el = spots[i];
+      if (!shown(el)) continue;
+      var r = el.getBoundingClientRect();
+      if (r.width <= 2 || r.height <= 2) continue;
+      pool.push({ el: el, r: r, area: r.width * r.height });
     }
-    return null;
+    if (!pool.length) return null;
+    pool.sort(function (a, b) { return b.area - a.area; });
+    for (var j = 0; j < pool.length && j < 4; j++) {
+      var c = pool[j];
+      var hit = null;
+      try {
+        hit = document.elementFromPoint(c.r.x + c.r.width / 2, c.r.y + c.r.height / 2);
+      } catch (e) { hit = null; }
+      if (!hit || c.el.contains(hit) || hit.contains(c.el)) return c.el;
+    }
+    return pool[0].el;
   }
 
   function spotAmount(side) {
@@ -973,26 +1066,48 @@
    *   - kiểm tra ô cược bằng phép rẻ (quickReady) thay vì quét popup mỗi cú bấm.
    */
 
-  /* Hiển thị kiểu RẺ: chỉ dựa vào layout, không gọi getComputedStyle.
-   * Bản đầy đủ `visible()` được gọi ở nơi khác; trong vòng lặp 60fps thì
-   * getComputedStyle cho mỗi chip làm chậm cả khung hình. */
+  /* Hiển thị kiểu RẺ: chỉ dựa vào box đã layout, không gọi getComputedStyle.
+   *
+   * KHÔNG dùng `offsetParent === null` để kết luận "ẩn": khay chip của Evolution là
+   * overlay `position: fixed`, và với phần tử fixed thì offsetParent luôn null dù nó
+   * đang hiện — dùng offsetParent sẽ đọc khay thành rỗng và bỏ qua toàn bộ chip.
+   * getClientRects() trả rỗng chỉ khi display:none / chưa có box, đúng ý cần.
+   */
   function shown(el) {
     if (!el) return false;
-    if (el.offsetParent === null && el.getClientRects().length === 0) return false;
-    return true;
+    return el.getClientRects().length > 0;
   }
 
   function amountOfSpot(spot) {
     if (!spot || !document.contains(spot)) return null;
-    var total = 0;
+
+    // Cộng chip đang vẽ trong DOM.
+    var dom = 0;
     var els = spot.querySelectorAll('[data-role="chip"]');
     for (var i = 0; i < els.length; i++) {
       var el = els[i];
-      if (!shown(el)) continue;
+      // Dùng visible() ĐẦY ĐỦ ở đây: chip đang mờ dần (opacity 0) hoặc sắp bị gỡ vẫn
+      // còn box, cộng nhầm nó là cộng tiền hai lần. Đây là chỗ quyết định đặt thêm
+      // hay dừng nên phải chính xác, không dùng phép kiểm tra rẻ.
+      if (!visible(el)) continue;
       var v = parseInt(el.getAttribute('data-value'), 10);
-      if (isFinite(v) && v > 0) total += v;
+      if (isFinite(v) && v > 0) dom += v;
     }
-    return total;
+
+    /* React state chỉ được TIN khi nó không lệch quá xa DOM.
+     *
+     * Đặt cược bằng tiền thật nên tuyệt đối không lấy một con số "nghe hợp lý" rồi
+     * kết luận đã đủ. Nếu fiber trả về số lệch hơn gấp đôi (hoặc DOM đang 0 mà React
+     * báo có tiền — dấu hiệu fiber cũ của ván trước), bỏ qua React và dùng DOM. */
+    var react = reactAmountOf(spot);
+    if (react !== null) {
+      if (dom === 0) {
+        if (react === 0) return 0;
+        return dom;                       // React nói có tiền nhưng DOM trống: fiber cũ
+      }
+      if (react >= dom * 0.5 && react <= dom * 2) return react;
+    }
+    return dom;
   }
 
   function frame(fn) {
@@ -1305,6 +1420,24 @@
         });
         if (gainedMixed + 0.5 < actualMixed) gainedMixed = actualMixed;
 
+        /* Bấm đủ [count] cú nhưng site có thể nhận ít hơn, hoặc nhận ĐÚNG count.
+         * Nếu thiếu: bấm bù từng cú một (không bấm lô) cho tới khi khớp — mỗi cú
+         * đọc lại ngay nên không thể vượt mức của mệnh giá này. */
+        var expectMixed = actualMixed + denom * count;
+        var refill = 0;
+        while (gainedMixed + 0.5 < expectMixed && refill < count + 6 &&
+               Date.now() < placeUntil) {
+          refill += 1;
+          var beforeRefill = taps;
+          await burst(1);
+          if (taps === beforeRefill) break;
+          var nowRefill = await quickDelta(side, start, {
+            reach: want, quietMs: 60, timeoutMs: 300 + delay + 20
+          });
+          if (nowRefill > gainedMixed + 0.5) gainedMixed = nowRefill;
+          else if (Date.now() >= placeUntil) break;
+        }
+
         var checkMixed = quickReady(liveSpot()) ? null : bettingAvailability(side);
         if (checkMixed && !checkMixed.ready) {
           unavailable = checkMixed;
@@ -1354,25 +1487,47 @@
       };
     }
 
-    /* ---------- B) MỘT mệnh giá: bấm nhanh nhất có thể ---------- */
+    /* ---------- B) MỘT mệnh giá: bấm theo lô nhỏ, không bao giờ vượt mức ---------- */
 
-    // Nếu chip đang chọn đọc được tin cậy và khớp kế hoạch thì KHÔNG cần bấm đo:
-    // bấm luôn cả cụm, chỉ kiểm tra lại cuối. Thiếu thì mới đo rồi bù.
+    /* Bản trước bấm HẾT cả cụm rồi mới đọc lại ô cược. Nếu site chậm hơn dự kiến
+     * hoặc chip trước đó đã lên, số dư trên bàn vượt mức cần — mất tiền thật và
+     * bậc gấp thếp sau đó tính sai. Bản này chỉ bấm tối đa bằng phần còn thiếu đã
+     * XÁC NHẬN, nên dù site phản hồi chậm bao nhiêu cũng không thể vượt. */
+
     var unit = 0;
     if (isFinite(currentSelection) && currentSelection > 0 && currentSelection === chipPlan[0]) {
       unit = currentSelection;
     }
 
     var actual = 0;
+    // Tổng đã bấm theo kế hoạch (để biết còn bao nhiêu cú nữa mới đủ).
+    var plannedTaps = 0;
+
     if (unit > 0) {
-      await burst(chipPlan.length);
-      actual = await quickDelta(side, start, {
-        reach: want, quietMs: 100,
-        timeoutMs: 500 + chipPlan.length * (delay + 26)
-      });
+      // Đã biết mệnh giá: bấm từng lô, đọc lại sau mỗi lô, dừng ngay khi đủ.
+      var remaining = want;
+      while (remaining > 0.5 && taps < 600 && Date.now() < placeUntil) {
+        var canTap = Math.max(1, Math.min(
+          Math.ceil(remaining / unit),          // không bấm quá phần còn thiếu
+          batchSize
+        ));
+        var before2 = taps;
+        var did = await burst(canTap);
+        if (did === 0) break;
+        plannedTaps += did;
+        var now2 = await quickDelta(side, start, {
+          reach: want, quietMs: 60,
+          timeoutMs: 300 + did * (delay + 20)
+        });
+        if (now2 > actual + 0.5) actual = now2;
+        // Tiến độ thực tế quyết định phần còn lại, không dựa vào số đã bấm.
+        remaining = want - actual;
+        if (taps === before2) break;
+      }
     } else {
-      // Bấm 1 cú để ĐO mệnh giá thật rồi bù phần còn lại ngay trong cùng lượt.
+      // Chưa biết mệnh giá: bấm 1 cú để ĐO, rồi phần còn lại cũng theo lô nhỏ.
       await burst(1);
+      plannedTaps += 1;
       unit = await quickDelta(side, start, { quietMs: 90, timeoutMs: 900 });
       if (unit <= 0) {
         return {
@@ -1382,29 +1537,40 @@
           want: want, taps: taps, steps: steps
         };
       }
-      var needNow = Math.max(0, Math.round((want - unit) / unit));
-      if (needNow > 0) await burst(needNow);
-      actual = await quickDelta(side, start, {
-        reach: want, quietMs: 100,
-        timeoutMs: 500 + needNow * (delay + 26)
-      });
+      actual = unit;
+      var remaining3 = want - actual;
+      while (remaining3 > 0.5 && taps < 600 && Date.now() < placeUntil) {
+        var canTap3 = Math.max(1, Math.min(Math.ceil(remaining3 / unit), batchSize));
+        var did3 = await burst(canTap3);
+        if (did3 === 0) break;
+        plannedTaps += did3;
+        var now3 = await quickDelta(side, start, {
+          reach: want, quietMs: 60,
+          timeoutMs: 300 + did3 * (delay + 20)
+        });
+        if (now3 > actual + 0.5) actual = now3;
+        remaining3 = want - actual;
+      }
     }
 
-    // Bù thêm nếu site bỏ qua vài cú (animation chip / mạng chậm).
+    // Bù lần cuối: chỉ bấm đúng phần còn thiếu, tối đa vài cú một lượt.
     var guard = 0;
-    while (actual + 0.5 < want && guard < 12 && taps < 600 && Date.now() < placeUntil) {
+    while (actual + 0.5 < want && guard < 10 && taps < 600 && Date.now() < placeUntil) {
       guard += 1;
-      var need = want - actual;
-      var burstCount = Math.max(1, Math.min(Math.ceil(need / (unit || 1)), 40));
-      var before = taps;
-      await burst(burstCount);
-      if (taps === before) break;
+      var missingNow = want - actual;
+      var fixCount = Math.max(1, Math.min(
+        Math.ceil(missingNow / (unit || 1)),
+        batchSize
+      ));
+      var beforeFix = taps;
+      await burst(fixCount);
+      if (taps === beforeFix) break;
       var gained = await quickDelta(side, start, {
-        reach: want, quietMs: 100,
-        timeoutMs: 400 + burstCount * (delay + 26)
+        reach: want, quietMs: 70,
+        timeoutMs: 300 + fixCount * (delay + 22)
       });
       if (gained <= actual + 0.5) {
-        await sleep(120);
+        await sleep(80);
         continue;
       }
       actual = gained;
